@@ -4,18 +4,25 @@
 //! The goal is to provide one project view independent on the build system (cargo / standalone
 //! rustc) and its configuration (e.g.: linker type).
 
+use crate::call_cargo::BuildFailure;
+use crate::call_cbmc::VerificationStatus;
+use crate::coverage::cov_results::CoverageRegion;
 use crate::metadata::from_json;
 use crate::session::KaniSession;
 use crate::util::{crate_name, info_operation};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use kani_metadata::{
     ArtifactType, ArtifactType::*, HarnessMetadata, KaniMetadata, artifact::convert_type,
 };
+use serde::Deserialize;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env::current_dir;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use tracing::{debug, trace};
+use std::sync::Mutex;
+use tracing::{debug, info, trace, warn};
 
 /// This structure represent the project information relevant for verification.
 /// A `Project` contains information about all crates under verification, as well as all
@@ -26,7 +33,8 @@ use tracing::{debug, trace};
 ///
 /// However, one artifact can be used for multiple harnesses. This will depend on the type of
 /// artifact, but it should be transparent for the user of this object.
-#[derive(Debug, Default)]
+
+#[derive(Debug)]
 pub struct Project {
     /// Each target crate metadata.
     pub metadata: Vec<KaniMetadata>,
@@ -39,9 +47,31 @@ pub struct Project {
     /// Note that it will only be `Some(...)` if this was built from a standalone project.
     pub input: Option<PathBuf>,
     /// The collection of artifacts kept as part of this project.
-    artifacts: Vec<Artifact>,
+    artifacts: Mutex<Vec<Artifact>>,
+    /// Information required to lazily materialize goto binaries per harness.
+    goto_pending: HashMap<String, PendingGoto>,
+    /// Cache of goto artifacts that were already materialized.
+    goto_cache: Mutex<HashMap<String, Artifact>>,
     /// Records the cargo metadata from the build, if there was any
     pub cargo_metadata: Option<cargo_metadata::Metadata>,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            metadata: Vec::new(),
+            outdir: PathBuf::new(),
+            input: None,
+            artifacts: Mutex::new(Vec::new()),
+            goto_pending: HashMap::new(),
+            goto_cache: Mutex::new(HashMap::new()),
+            cargo_metadata: None,
+        }
+    }
+}
+
+fn harness_identity(harness: &HarnessMetadata) -> String {
+    harness.mangled_name.clone()
 }
 
 impl Project {
@@ -66,16 +96,24 @@ impl Project {
         &self,
         harness: &HarnessMetadata,
         typ: ArtifactType,
-    ) -> Option<&Artifact> {
+    ) -> Option<Artifact> {
+        if matches!(typ, ArtifactType::Goto) {
+            let cache = self.goto_cache.lock().unwrap();
+            return cache.get(&harness_identity(harness)).cloned();
+        }
         let expected_path = harness
             .goto_file
             .as_ref()
             .and_then(|goto_file| convert_type(goto_file, SymTabGoto, typ).canonicalize().ok());
         trace!(?harness.goto_file, ?expected_path, ?typ, "get_harness_artifact");
-        self.artifacts.iter().find(|artifact| {
-            artifact.has_type(typ)
-                && expected_path.as_ref().is_none_or(|goto_file| *goto_file == artifact.path)
-        })
+        let artifacts = self.artifacts.lock().unwrap();
+        artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.has_type(typ)
+                    && expected_path.as_ref().is_none_or(|goto_file| *goto_file == artifact.path)
+            })
+            .cloned()
     }
 
     /// Try to build a new project from the build result metadata.
@@ -89,36 +127,2677 @@ impl Project {
         metadata: Vec<KaniMetadata>,
         cargo_metadata: Option<cargo_metadata::Metadata>,
     ) -> Result<Self> {
-        // For each harness (test or proof) from each metadata, read the path for the goto
-        // SymTabGoto file. Use that path to find all the other artifacts.
-        let mut artifacts = vec![];
-        for crate_metadata in &metadata {
-            for harness_metadata in
-                crate_metadata.test_harnesses.iter().chain(crate_metadata.proof_harnesses.iter())
-            {
-                let symtab_out = Artifact::try_new(
-                    harness_metadata.goto_file.as_ref().expect("Expected a model file"),
-                    SymTabGoto,
-                )?;
-                let goto_path = convert_type(&symtab_out.path, symtab_out.typ, Goto);
+        let mut metadata = metadata;
+        let artifacts = Mutex::new(Vec::new());
+        let mut goto_pending: HashMap<String, PendingGoto> = HashMap::new();
 
-                // Link
-                session.link_goto_binary(&[symtab_out.to_path_buf()], &goto_path)?;
-                let goto = Artifact::try_new(&goto_path, Goto)?;
+        for crate_metadata in &mut metadata {
+            Self::retain_valid_harnesses(
+                session,
+                &outdir,
+                &mut crate_metadata.test_harnesses,
+                &artifacts,
+                &mut goto_pending,
+            );
+            Self::retain_valid_harnesses(
+                session,
+                &outdir,
+                &mut crate_metadata.proof_harnesses,
+                &artifacts,
+                &mut goto_pending,
+            );
+        }
 
-                // All other harness artifacts that may have been generated as part of the build.
-                artifacts.extend(
-                    [SymTab, TypeMap, VTableRestriction, PrettyNameMap].iter().filter_map(|typ| {
-                        let artifact = Artifact::try_from(&symtab_out, *typ).ok()?;
-                        Some(artifact)
-                    }),
-                );
-                artifacts.push(symtab_out);
-                artifacts.push(goto);
+        Ok(Project {
+            metadata,
+            outdir,
+            input,
+            artifacts,
+            goto_pending,
+            goto_cache: Mutex::new(HashMap::new()),
+            cargo_metadata,
+        })
+    }
+
+    fn retain_valid_harnesses(
+        _session: &KaniSession,
+        outdir: &Path,
+        harnesses: &mut Vec<HarnessMetadata>,
+        artifacts: &Mutex<Vec<Artifact>>,
+        goto_pending: &mut HashMap<String, PendingGoto>,
+    ) {
+        let mut retained = Vec::with_capacity(harnesses.len());
+        for harness in harnesses.drain(..) {
+            let key = harness_identity(&harness);
+            match Self::prepare_harness_artifacts(outdir, &harness) {
+                Ok((mut harness_artifacts, pending)) => {
+                    {
+                        let mut storage = artifacts.lock().unwrap();
+                        storage.append(&mut harness_artifacts);
+                    }
+                    if goto_pending.insert(key, pending).is_some() {
+                        warn!(
+                            harness = %harness.pretty_name,
+                            "Duplicate harness identity detected while registering goto metadata"
+                        );
+                    }
+                    retained.push(harness);
+                }
+                Err(error) => {
+                    warn!(
+                        harness = %harness.pretty_name,
+                        ?error,
+                        "Skipping harness due to artifact preparation failure"
+                    );
+                }
+            }
+        }
+        *harnesses = retained;
+    }
+
+    fn prepare_harness_artifacts(
+        outdir: &Path,
+        harness: &HarnessMetadata,
+    ) -> Result<(Vec<Artifact>, PendingGoto)> {
+        let goto_hint = harness.goto_file.as_ref().context("Harness metadata missing goto file")?;
+        let symtab_path = resolve_artifact_path(outdir, Path::new(goto_hint))
+            .context(format!("Unable to resolve artifact for {}", harness.pretty_name))?;
+        let symtab_out = Artifact::try_new(&symtab_path, SymTabGoto)?;
+        let goto_path = convert_type(&symtab_out.path, symtab_out.typ, Goto);
+        let mut artifacts = vec![symtab_out.clone()];
+        for typ in [SymTab, TypeMap, VTableRestriction, PrettyNameMap] {
+            if let Ok(artifact) = Artifact::try_from(&symtab_out, typ) {
+                artifacts.push(artifact);
+            }
+        }
+        let pending = PendingGoto { inputs: vec![symtab_out.to_path_buf()], output: goto_path };
+        Ok((artifacts, pending))
+    }
+
+    pub fn ensure_goto_artifact(
+        &self,
+        session: &KaniSession,
+        harness: &HarnessMetadata,
+    ) -> Result<Artifact> {
+        let key = harness_identity(harness);
+        if let Some(cached) = self.goto_cache.lock().unwrap().get(&key).cloned() {
+            return Ok(cached);
+        }
+
+        let pending = self.goto_pending.get(&key).context(format!(
+            "Missing goto preparation data for harness {}",
+            harness.pretty_name
+        ))?;
+        session.link_goto_binary(&pending.inputs, &pending.output)?;
+        let artifact = Artifact::try_new(&pending.output, Goto)?;
+
+        {
+            let mut cache = self.goto_cache.lock().unwrap();
+            cache.insert(key.clone(), artifact.clone());
+        }
+        {
+            let mut storage = self.artifacts.lock().unwrap();
+            storage.push(artifact.clone());
+        }
+
+        Ok(artifact)
+    }
+
+    pub fn current_artifacts(&self) -> Vec<Artifact> {
+        self.artifacts.lock().unwrap().clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct HarnessKey {
+    dataset: String,
+    index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingGoto {
+    inputs: Vec<PathBuf>,
+    output: PathBuf,
+}
+
+fn resolve_artifact_path(outdir: &Path, goto_hint: &Path) -> Option<PathBuf> {
+    trace!(?goto_hint, ?outdir, "resolve_artifact_path start");
+    if let Ok(path) = goto_hint.canonicalize() {
+        trace!(?path, "resolve_artifact_path canonicalized");
+        return Some(path);
+    }
+
+    let file_name = goto_hint.file_name()?;
+    let direct = outdir.join(file_name);
+    if direct.exists() {
+        if let Ok(path) = direct.canonicalize() {
+            trace!(?path, "resolve_artifact_path rebound to outdir");
+            return Some(path);
+        }
+    }
+
+    let file_name_str = file_name.to_str()?;
+    let suffix = file_name_str.splitn(2, "__").nth(1).unwrap_or(file_name_str);
+    let search_roots = [outdir, outdir.parent().unwrap_or(outdir)];
+    for candidate_dir in search_roots {
+        if let Ok(entries) = fs::read_dir(candidate_dir) {
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(suffix) {
+                        if let Ok(path) = path.canonicalize() {
+                            trace!(?path, "resolve_artifact_path suffix match");
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    trace!("resolve_artifact_path failed to find candidate");
+    None
+}
+
+enum SkipAction {
+    ModuleRemoval { mod_path: PathBuf, original: String },
+    FileRename { original: PathBuf, backup: PathBuf },
+}
+
+struct HarnessSkipper {
+    actions: Vec<SkipAction>,
+    skipped: HashSet<PathBuf>,
+}
+
+impl HarnessSkipper {
+    fn new() -> Self {
+        Self { actions: Vec::new(), skipped: HashSet::new() }
+    }
+
+    fn skip(&mut self, source: &Path) -> Result<bool> {
+        let absolute = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            match std::env::current_dir() {
+                Ok(dir) => dir.join(source),
+                Err(_) => source.to_path_buf(),
+            }
+        };
+
+        let canonical = match absolute.canonicalize() {
+            Ok(path) => path,
+            Err(_) => return Ok(false),
+        };
+
+        if !self.skipped.insert(canonical.clone()) {
+            return Ok(false);
+        }
+
+        if canonical.is_dir() {
+            self.skipped.remove(&canonical);
+            return Ok(false);
+        }
+
+        if let Some(action) = self.remove_module_declaration(&canonical)? {
+            info!(
+                ?source,
+                module = ?canonical.file_stem(),
+                "Skipping synthesized harness by editing module file"
+            );
+            self.actions.push(action);
+            return Ok(true);
+        }
+
+        if let Some(action) = self.rename_source(&canonical)? {
+            info!(?source, "Skipping synthesized harness by renaming source file");
+            self.actions.push(action);
+            return Ok(true);
+        }
+
+        self.skipped.remove(&canonical);
+        Ok(false)
+    }
+
+    fn restore_all(&mut self) {
+        while let Some(action) = self.actions.pop() {
+            match action {
+                SkipAction::ModuleRemoval { mod_path, original } => {
+                    if let Err(err) = fs::write(&mod_path, original) {
+                        warn!(?mod_path, ?err, "Failed to restore module file after harness skip");
+                    }
+                }
+                SkipAction::FileRename { original, backup } => {
+                    if original.exists() {
+                        if let Err(err) = fs::remove_file(&original) {
+                            warn!(?original, ?err, "Failed to remove generated harness stub");
+                            continue;
+                        }
+                    }
+                    if backup.exists() {
+                        if let Err(err) = fs::rename(&backup, &original) {
+                            warn!(
+                                ?original,
+                                ?backup,
+                                ?err,
+                                "Failed to restore skipped harness source"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.skipped.clear();
+    }
+
+    fn remove_module_declaration(&self, harness_path: &Path) -> Result<Option<SkipAction>> {
+        let Some(mod_file) = synthesized_mod_file(harness_path) else {
+            debug!("Not a synthesized harness (no recognized module file)");
+            return Ok(None);
+        };
+
+        if !mod_file.exists() {
+            debug!("Not a synthesized harness (no module file in path)");
+            return Ok(None);
+        }
+
+        let original = fs::read_to_string(&mod_file)
+            .with_context(|| format!("Failed to read module file {}", mod_file.display()))?;
+
+        let harness_stem = harness_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| anyhow!("Invalid harness file name {}", harness_path.display()))?;
+
+        let mut modified = false;
+        let mut new_lines = Vec::new();
+        for line in original.lines() {
+            let trimmed = line.trim();
+            let matches = trimmed == format!("mod {harness_stem};")
+                || trimmed == format!("pub mod {harness_stem};");
+            if matches {
+                modified = true;
+                continue;
+            }
+            new_lines.push(line);
+        }
+
+        if !modified {
+            debug!("Not a synthesized harness (no declaration in module file)");
+            return Ok(None);
+        }
+
+        let mut new_content = new_lines.join("\n");
+        if original.ends_with('\n') {
+            new_content.push('\n');
+        }
+
+        fs::write(&mod_file, new_content)
+            .with_context(|| format!("Failed to update module file {}", mod_file.display()))?;
+
+        Ok(Some(SkipAction::ModuleRemoval { mod_path: mod_file, original }))
+    }
+
+    fn rename_source(&self, canonical: &Path) -> Result<Option<SkipAction>> {
+        if !is_synthesized_harness_source(canonical) {
+            return Ok(None);
+        }
+
+        let file_name = match canonical.file_name() {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        let mut new_name = file_name.to_os_string();
+        new_name.push(".kani-skip");
+        let backup = canonical.with_file_name(new_name);
+
+        if backup.exists() {
+            fs::remove_file(&backup).ok();
+        }
+
+        fs::rename(canonical, &backup).with_context(|| {
+            format!(
+                "Failed to rename harness source {} to {}",
+                canonical.display(),
+                backup.display()
+            )
+        })?;
+
+        let stub_content = concat!(
+            "// This file was generated by Kani to bypass a failing synthesized harness.\n",
+            "#![allow(dead_code)]\n",
+            "#![allow(unused_variables)]\n",
+            "fn kani_skipped_harness_stub() {}\n"
+        );
+        fs::write(canonical, stub_content)
+            .with_context(|| format!("Failed to write harness stub at {}", canonical.display()))?;
+
+        Ok(Some(SkipAction::FileRename { original: canonical.to_path_buf(), backup }))
+    }
+}
+
+impl Drop for HarnessSkipper {
+    fn drop(&mut self) {
+        self.restore_all();
+    }
+}
+
+fn is_synthesized_harness_source(path: &Path) -> bool {
+    let file_name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    if !(file_name.starts_with("test_") || file_name.starts_with("kani_test")) {
+        return false;
+    }
+
+    let Some(parent) = path.parent() else { return false };
+    match parent.file_name().and_then(|n| n.to_str()) {
+        Some("varies_test_files") => true,
+        Some("src") => {
+            let lib_rs = parent.join("lib.rs");
+            lib_rs.is_file() && has_kani_cfg_marker(&lib_rs)
+        }
+        _ => false,
+    }
+}
+
+fn has_kani_cfg_marker(lib_rs: &Path) -> bool {
+    match fs::read_to_string(lib_rs) {
+        Ok(content) => content.lines().take(64).any(|line| line.trim() == "#![cfg(kani)]"),
+        Err(_) => false,
+    }
+}
+
+fn synthesized_mod_file(harness_path: &Path) -> Option<PathBuf> {
+    if !is_synthesized_harness_source(harness_path) {
+        return None;
+    }
+
+    let parent = harness_path.parent()?;
+    let parent_name = parent.file_name().and_then(|n| n.to_str());
+    if parent_name == Some("varies_test_files") {
+        return Some(parent.join("mod.rs"));
+    }
+    if parent_name == Some("src") {
+        return Some(parent.join("lib.rs"));
+    }
+    None
+}
+impl HarnessKey {
+    fn new(dataset: String, index: usize) -> Self {
+        Self { dataset, index }
+    }
+
+    fn with_index(&self, index: usize) -> Self {
+        Self { dataset: self.dataset.clone(), index }
+    }
+
+    fn id(&self) -> String {
+        format!("{}:{}", self.dataset, self.index)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SynthSequence {
+    #[allow(dead_code)]
+    initial_cost: f64,
+    predecessor: Option<usize>,
+    predecessors: Vec<usize>,
+    target: Option<usize>,
+    successors: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSynthSequence {
+    index: usize,
+    predecessor: usize,
+    #[serde(default)]
+    parents: Vec<usize>,
+    #[serde(default)]
+    cost: f64,
+    #[serde(default)]
+    target: Option<usize>,
+    #[serde(default)]
+    is_basic: bool,
+    #[serde(default, rename = "successor")]
+    successors: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct SynthNode<'a> {
+    harness: &'a HarnessMetadata,
+    parent: Option<HarnessKey>,
+    parents: Vec<HarnessKey>,
+    children: Vec<HarnessKey>,
+    target: Option<usize>,
+    depth: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessCoverageInput {
+    pub covered_regions: HashSet<CoverageRegion>,
+    pub uncovered_regions: HashSet<CoverageRegion>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessCoverageStats {
+    pub covered_cnt: usize,
+    pub uncovered_cnt: usize,
+    pub uncovered_filtered_cnt: usize,
+    pub delta_covered_cnt: usize,
+}
+
+impl HarnessCoverageStats {
+    pub fn uncovered_ratio(&self) -> f64 {
+        if self.covered_cnt == 0 {
+            if self.uncovered_filtered_cnt == 0 { 0.0 } else { f64::INFINITY }
+        } else {
+            self.uncovered_filtered_cnt as f64 / self.covered_cnt as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
+struct CompactCoverageRegion {
+    file_id: u32,
+    start: (u32, u32),
+    end: (u32, u32),
+}
+
+impl CompactCoverageRegion {
+    fn from_region(file_id: u32, region: &CoverageRegion) -> Self {
+        Self { file_id, start: region.start, end: region.end }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CoverageHistory {
+    files: Vec<String>,
+    file_ids: HashMap<String, u32>,
+    covered_regions: HashSet<CompactCoverageRegion>,
+    uncovered_regions: HashSet<CompactCoverageRegion>,
+}
+
+impl CoverageHistory {
+    fn intern_file(&mut self, file: &str) -> u32 {
+        if let Some(file_id) = self.file_ids.get(file) {
+            *file_id
+        } else {
+            let file_id = self.files.len() as u32;
+            self.files.push(file.to_string());
+            self.file_ids.insert(file.to_string(), file_id);
+            file_id
+        }
+    }
+
+    fn compact_region(&mut self, region: &CoverageRegion) -> CompactCoverageRegion {
+        let file_id = self.intern_file(&region.file);
+        CompactCoverageRegion::from_region(file_id, region)
+    }
+
+    pub fn insert_covered(&mut self, region: &CoverageRegion) -> bool {
+        let compact = self.compact_region(region);
+        self.covered_regions.insert(compact)
+    }
+
+    pub fn insert_uncovered(&mut self, region: &CoverageRegion) -> bool {
+        let compact = self.compact_region(region);
+        self.uncovered_regions.insert(compact)
+    }
+
+    pub fn remove_uncovered(&mut self, region: &CoverageRegion) -> bool {
+        let compact = self.compact_region(region);
+        self.uncovered_regions.remove(&compact)
+    }
+
+    pub fn contains_covered(&self, region: &CoverageRegion) -> bool {
+        let Some(&file_id) = self.file_ids.get(&region.file) else {
+            return false;
+        };
+        self.covered_regions.contains(&CompactCoverageRegion::from_region(file_id, region))
+    }
+
+    pub fn covered_count(&self) -> usize {
+        self.covered_regions.len()
+    }
+
+    pub fn uncovered_count(&self) -> usize {
+        self.uncovered_regions.len()
+    }
+
+    pub fn covered_regions(&self) -> Vec<CoverageRegion> {
+        self.expand_regions(&self.covered_regions)
+    }
+
+    pub fn uncovered_regions(&self) -> Vec<CoverageRegion> {
+        self.expand_regions(&self.uncovered_regions)
+    }
+
+    fn expand_regions(&self, regions: &HashSet<CompactCoverageRegion>) -> Vec<CoverageRegion> {
+        regions
+            .iter()
+            .map(|region| CoverageRegion {
+                file: self.files[region.file_id as usize].clone(),
+                start: region.start,
+                end: region.end,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CoverageSummary {
+    pub target: Option<usize>,
+    pub covered_cnt: usize,
+    pub uncovered_cnt: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SynthCoverageScope {
+    Target,
+    Global,
+}
+
+impl Default for SynthCoverageScope {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SynthPruningMode {
+    Coverage,
+    FailureOnly,
+    Disabled,
+}
+
+impl Default for SynthPruningMode {
+    fn default() -> Self {
+        Self::Coverage
+    }
+}
+
+impl SynthPruningMode {
+    fn pruning_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    fn coverage_pruning_enabled(self) -> bool {
+        matches!(self, Self::Coverage)
+    }
+
+    fn timeout_pruning_enabled(self) -> bool {
+        matches!(self, Self::Coverage | Self::FailureOnly)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SynthTreeNode {
+    pub id: String,
+    pub pretty_name: String,
+    pub target: Option<usize>,
+    pub parent: Option<String>,
+    pub children: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SynthTreeSnapshot {
+    pub nodes: Vec<SynthTreeNode>,
+}
+
+#[derive(Debug, Clone)]
+enum SkipReason {
+    AncestorFailure,
+    AncestorPruned(String),
+    BelowDeltaThreshold,
+    BelowUncoveredThreshold,
+    NotInTopK,
+    TargetTimeout,
+    Untracked,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionSummary {
+    selected: Vec<HarnessKey>,
+    forced_count: usize,
+    k: usize,
+}
+
+impl SkipReason {
+    fn as_str(&self) -> String {
+        match self {
+            SkipReason::AncestorFailure => "ancestor_failure".to_string(),
+            SkipReason::AncestorPruned(reason) => format!("ancestor_pruned({reason})"),
+            SkipReason::BelowDeltaThreshold => "delta_covered_threshold".to_string(),
+            SkipReason::BelowUncoveredThreshold => "uncovered_cnt_threshold".to_string(),
+            SkipReason::NotInTopK => "not_in_top_k".to_string(),
+            SkipReason::TargetTimeout => "target_timeout".to_string(),
+            SkipReason::Untracked => "untracked".to_string(),
+            SkipReason::Unknown => "unknown".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SynthCoverageConfig {
+    pub k_min: usize,
+    pub k_divisor: usize,
+    pub delta_threshold: usize,
+    pub uncovered_cnt_threshold: usize,
+    pub uncovered_ratio_threshold: f64,
+    pub score_delta_weight: f64,
+    pub score_uncovered_weight: f64,
+    pub coverage_scope: SynthCoverageScope,
+    pub pruning_mode: SynthPruningMode,
+}
+
+impl SynthCoverageConfig {
+    pub fn new(
+        k_min: usize,
+        k_divisor: usize,
+        delta_threshold: usize,
+        uncovered_cnt_threshold: usize,
+        uncovered_ratio_threshold: f64,
+        score_delta_weight: f64,
+        score_uncovered_weight: f64,
+        coverage_scope: SynthCoverageScope,
+        pruning_mode: SynthPruningMode,
+    ) -> Self {
+        SynthCoverageConfig {
+            k_min,
+            k_divisor: if k_divisor == 0 { 1 } else { k_divisor },
+            delta_threshold,
+            uncovered_cnt_threshold,
+            uncovered_ratio_threshold,
+            score_delta_weight: sanitize_score_weight(score_delta_weight),
+            score_uncovered_weight: sanitize_score_weight(score_uncovered_weight),
+            coverage_scope,
+            pruning_mode,
+        }
+    }
+}
+
+fn sanitize_score_weight(weight: f64) -> f64 {
+    if weight.is_finite() && !weight.is_sign_negative() { weight } else { 0.0 }
+}
+
+#[derive(Debug, Clone)]
+struct HeapEntry<'a> {
+    depth: usize,
+    order: u64,
+    harness: &'a HarnessMetadata,
+    key: HarnessKey,
+}
+
+impl<'a> PartialEq for HeapEntry<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.depth == other.depth && self.order == other.order
+    }
+}
+
+impl<'a> Eq for HeapEntry<'a> {}
+
+impl<'a> PartialOrd for HeapEntry<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a> Ord for HeapEntry<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.depth.cmp(&other.depth).then(self.order.cmp(&other.order))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SynthHarnessScheduler<'a> {
+    nodes: HashMap<HarnessKey, SynthNode<'a>>,
+    ready: BinaryHeap<Reverse<HeapEntry<'a>>>,
+    key_by_ptr: HashMap<*const HarnessMetadata, HarnessKey>,
+    key_by_harness_ptr: HashMap<*const HarnessMetadata, HarnessKey>,
+    completed: HashSet<HarnessKey>,
+    fallback: VecDeque<&'a HarnessMetadata>,
+    statuses: HashMap<HarnessKey, VerificationStatus>,
+    runtimes_secs: HashMap<HarnessKey, f64>,
+    coverage_stats: HashMap<HarnessKey, HarnessCoverageStats>,
+    coverage_history: HashMap<Option<usize>, CoverageHistory>,
+    processed_parents: HashSet<HarnessKey>,
+    expandable: HashSet<HarnessKey>,
+    pruned_reasons: HashMap<HarnessKey, SkipReason>,
+    timed_out_targets: HashSet<Option<usize>>,
+    coverage_config: SynthCoverageConfig,
+    next_order: u64,
+}
+
+pub(crate) struct SynthSchedulerPlan<'a> {
+    pub scheduler: SynthHarnessScheduler<'a>,
+    pub harnesses: Vec<&'a HarnessMetadata>,
+}
+
+impl<'a> SynthHarnessScheduler<'a> {
+    fn new(
+        nodes: HashMap<HarnessKey, SynthNode<'a>>,
+        fallback: VecDeque<&'a HarnessMetadata>,
+        coverage_config: SynthCoverageConfig,
+    ) -> Self {
+        let mut scheduler = SynthHarnessScheduler {
+            nodes,
+            ready: BinaryHeap::new(),
+            key_by_ptr: HashMap::new(),
+            key_by_harness_ptr: HashMap::new(),
+            completed: HashSet::new(),
+            fallback,
+            statuses: HashMap::new(),
+            runtimes_secs: HashMap::new(),
+            coverage_stats: HashMap::new(),
+            coverage_history: HashMap::new(),
+            processed_parents: HashSet::new(),
+            expandable: HashSet::new(),
+            pruned_reasons: HashMap::new(),
+            timed_out_targets: HashSet::new(),
+            coverage_config,
+            next_order: 0,
+        };
+
+        scheduler.key_by_harness_ptr = scheduler
+            .nodes
+            .iter()
+            .map(|(key, node)| (node.harness as *const _, key.clone()))
+            .collect();
+
+        scheduler.prepare_roots();
+        scheduler
+    }
+
+    fn prepare_roots(&mut self) {
+        let mut roots_by_target: HashMap<Option<usize>, Vec<HarnessKey>> = HashMap::new();
+        for (key, node) in &self.nodes {
+            if node.parents.is_empty() {
+                roots_by_target.entry(node.target).or_default().push(key.clone());
             }
         }
 
-        Ok(Project { outdir, input, metadata, artifacts, cargo_metadata })
+        let mut targets: Vec<Option<usize>> = roots_by_target.keys().cloned().collect();
+        targets.sort_by(|a, b| match (a, b) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+        });
+
+        for target in targets {
+            match target {
+                Some(idx) => info!(target_idx = idx, "Queueing synthesized target roots"),
+                None => info!("Queueing synthesized target roots: unknown"),
+            }
+            if let Some(root_keys) = roots_by_target.remove(&target) {
+                for key in root_keys {
+                    if let Some(node) = self.nodes.get(&key) {
+                        self.expandable.insert(key.clone());
+                        self.push_ready(&key, node.harness, node.depth);
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_ready(&mut self, key: &HarnessKey, harness: &'a HarnessMetadata, depth: usize) {
+        self.next_order += 1;
+        self.ready.push(Reverse(HeapEntry {
+            depth,
+            order: self.next_order,
+            harness,
+            key: key.clone(),
+        }));
+    }
+
+    pub fn next(&mut self) -> Option<&'a HarnessMetadata> {
+        while let Some(Reverse(entry)) = self.ready.pop() {
+            if self.completed.contains(&entry.key) {
+                continue;
+            }
+            self.key_by_ptr.insert(entry.harness as *const _, entry.key.clone());
+            return Some(entry.harness);
+        }
+        self.fallback.pop_front()
+    }
+
+    pub fn record_result(
+        &mut self,
+        harness: &'a HarnessMetadata,
+        duration_secs: f64,
+        status: VerificationStatus,
+        coverage: Option<HarnessCoverageInput>,
+    ) {
+        let ptr = harness as *const _;
+        let Some(key) = self.key_by_ptr.remove(&ptr) else {
+            return;
+        };
+
+        self.statuses.insert(key.clone(), status);
+        self.runtimes_secs.insert(key.clone(), duration_secs);
+
+        if let Some(coverage) = coverage {
+            let stats = self.record_coverage_stats(&key, coverage);
+            debug!(
+                harness = %harness.pretty_name,
+                covered = stats.covered_cnt,
+                uncovered = stats.uncovered_cnt,
+                uncovered_filtered = stats.uncovered_filtered_cnt,
+                delta = stats.delta_covered_cnt,
+                ratio = stats.uncovered_ratio(),
+                "Synthesized harness coverage stats"
+            );
+            self.coverage_stats.insert(key.clone(), stats);
+        }
+
+        if !self.completed.insert(key.clone()) {
+            return;
+        }
+
+        let target = self.nodes.get(&key).and_then(|n| n.target);
+        let target_not_timed_out = !self.coverage_config.pruning_mode.timeout_pruning_enabled()
+            || !self.timed_out_targets.contains(&target);
+        if target_not_timed_out {
+            self.maybe_enqueue_ready_children(&key);
+        }
+
+        if self.coverage_config.pruning_mode.coverage_pruning_enabled() {
+            if let Some(parent_keys) = self.nodes.get(&key).map(|node| node.parents.clone()) {
+                for parent_key in parent_keys {
+                    self.maybe_process_parent(&parent_key);
+                }
+            }
+        }
+    }
+
+    fn record_coverage_stats(
+        &mut self,
+        key: &HarnessKey,
+        coverage: HarnessCoverageInput,
+    ) -> HarnessCoverageStats {
+        let target = self.nodes.get(key).and_then(|node| node.target);
+        let coverage_key = match self.coverage_config.coverage_scope {
+            SynthCoverageScope::Target => target,
+            SynthCoverageScope::Global => None,
+        };
+        let history = self.coverage_history.entry(coverage_key).or_default();
+        let mut delta_covered_cnt = 0;
+        for region in &coverage.covered_regions {
+            if history.insert_covered(region) {
+                delta_covered_cnt += 1;
+            }
+            history.remove_uncovered(region);
+        }
+        let uncovered_total = coverage.uncovered_regions.len();
+        let filtered_uncovered_cnt = coverage
+            .uncovered_regions
+            .iter()
+            .filter(|region| !history.contains_covered(region))
+            .count();
+        for region in &coverage.uncovered_regions {
+            if !history.contains_covered(region) {
+                history.insert_uncovered(region);
+            }
+        }
+        HarnessCoverageStats {
+            covered_cnt: coverage.covered_regions.len(),
+            uncovered_cnt: uncovered_total,
+            uncovered_filtered_cnt: filtered_uncovered_cnt,
+            delta_covered_cnt,
+        }
+    }
+
+    fn maybe_enqueue_ready_children(&mut self, key: &HarnessKey) {
+        let Some(node) = self.nodes.get(key) else {
+            return;
+        };
+        let children_to_schedule: Vec<HarnessKey> = node
+            .children
+            .iter()
+            .filter(|child_key| self.nodes.contains_key(*child_key))
+            .cloned()
+            .collect();
+        for child_key in children_to_schedule {
+            if self.completed.contains(&child_key) {
+                continue;
+            }
+            if self.child_is_ready_for_retention(&child_key) {
+                let Some(child_node) = self.nodes.get(&child_key) else {
+                    continue;
+                };
+                self.push_ready(&child_key, child_node.harness, child_node.depth);
+            }
+        }
+    }
+
+    fn child_is_ready_for_retention(&self, child_key: &HarnessKey) -> bool {
+        let Some(node) = self.nodes.get(child_key) else {
+            return false;
+        };
+        if node.parents.is_empty() {
+            return true;
+        }
+        if self.coverage_config.pruning_mode.pruning_disabled() {
+            return node.parents.iter().all(|parent_key| self.statuses.contains_key(parent_key));
+        }
+
+        let mut has_selected_parent = false;
+        for parent_key in &node.parents {
+            match self.statuses.get(parent_key) {
+                Some(VerificationStatus::Failure) | None => return false,
+                Some(VerificationStatus::Success) => {
+                    if self.parent_is_selected(parent_key) {
+                        has_selected_parent = true;
+                    }
+                }
+            }
+        }
+
+        has_selected_parent
+    }
+
+    fn parent_is_selected(&self, parent_key: &HarnessKey) -> bool {
+        if self.statuses.get(parent_key) != Some(&VerificationStatus::Success) {
+            return false;
+        }
+        if self.coverage_config.pruning_mode.coverage_pruning_enabled() {
+            self.expandable.contains(parent_key)
+        } else {
+            true
+        }
+    }
+
+    fn maybe_process_parent(&mut self, parent_key: &HarnessKey) {
+        if self.processed_parents.contains(parent_key) {
+            return;
+        }
+        if self.statuses.get(parent_key) != Some(&VerificationStatus::Success) {
+            return;
+        }
+        let (parent_name, children) = match self.nodes.get(parent_key) {
+            Some(node) => (node.harness.pretty_name.clone(), node.children.clone()),
+            None => return,
+        };
+        let target = self.nodes.get(parent_key).and_then(|n| n.target);
+        if self.timed_out_targets.contains(&target) {
+            self.processed_parents.insert(parent_key.clone());
+            return;
+        }
+        if children.is_empty() {
+            self.processed_parents.insert(parent_key.clone());
+            return;
+        }
+        let all_children_completed =
+            children.iter().all(|child_key| self.completed.contains(child_key));
+        if !all_children_completed {
+            return;
+        }
+
+        let SelectionSummary { selected, forced_count, k } =
+            self.select_children_for_expansion(&children);
+        debug!(
+            parent = %parent_name,
+            successors = children.len(),
+            selected = selected.len(),
+            forced = forced_count,
+            k,
+            delta_th = self.coverage_config.delta_threshold,
+            unc_th = self.coverage_config.uncovered_cnt_threshold,
+            ratio_th = self.coverage_config.uncovered_ratio_threshold,
+            "Synthesized successor selection"
+        );
+        for child_key in selected {
+            self.expandable.insert(child_key.clone());
+            self.pruned_reasons.remove(&child_key);
+            if self.statuses.get(&child_key) == Some(&VerificationStatus::Success) {
+                self.maybe_enqueue_ready_children(&child_key);
+            }
+        }
+
+        self.processed_parents.insert(parent_key.clone());
+    }
+
+    fn select_children_for_expansion(&mut self, children: &[HarnessKey]) -> SelectionSummary {
+        let successor_cnt = children.len();
+        if successor_cnt == 0 {
+            return SelectionSummary { selected: Vec::new(), forced_count: 0, k: 0 };
+        }
+        let k = std::cmp::max(
+            self.coverage_config.k_min,
+            successor_cnt / self.coverage_config.k_divisor,
+        );
+
+        let mut force_selected = Vec::new();
+        let mut candidates: Vec<(HarnessKey, usize, usize, f64)> = Vec::new();
+
+        for child_key in children {
+            if self.statuses.get(child_key) != Some(&VerificationStatus::Success) {
+                continue;
+            }
+            let stats =
+                self.coverage_stats.get(child_key).cloned().unwrap_or(HarnessCoverageStats {
+                    covered_cnt: 0,
+                    uncovered_cnt: 0,
+                    uncovered_filtered_cnt: 0,
+                    delta_covered_cnt: 0,
+                });
+            if stats.uncovered_ratio() > self.coverage_config.uncovered_ratio_threshold {
+                force_selected.push(child_key.clone());
+            }
+            if stats.uncovered_ratio() <= self.coverage_config.uncovered_ratio_threshold {
+                if stats.delta_covered_cnt > self.coverage_config.delta_threshold
+                    && stats.uncovered_filtered_cnt > self.coverage_config.uncovered_cnt_threshold
+                {
+                    let runtime_secs =
+                        self.runtimes_secs.get(child_key).copied().unwrap_or_default();
+                    candidates.push((
+                        child_key.clone(),
+                        stats.delta_covered_cnt,
+                        stats.uncovered_filtered_cnt,
+                        runtime_secs,
+                    ));
+                } else {
+                    let reason = if stats.delta_covered_cnt <= self.coverage_config.delta_threshold
+                    {
+                        SkipReason::BelowDeltaThreshold
+                    } else {
+                        SkipReason::BelowUncoveredThreshold
+                    };
+                    self.pruned_reasons.entry(child_key.clone()).or_insert(reason);
+                }
+            }
+        }
+
+        let max_delta = candidates.iter().map(|(_, delta, _, _)| *delta).max().unwrap_or(0) as f64;
+        let max_uncovered =
+            candidates.iter().map(|(_, _, uncovered, _)| *uncovered).max().unwrap_or(0) as f64;
+        let max_runtime =
+            candidates.iter().map(|(_, _, _, runtime)| *runtime).fold(0.0_f64, f64::max);
+        let runtime_scale = max_runtime.max(f64::EPSILON);
+        let delta_scale = max_delta.max(1.0);
+        let uncovered_scale = max_uncovered.max(1.0);
+
+        let mut scored_candidates: Vec<(HarnessKey, f64)> = candidates
+            .into_iter()
+            .map(|(child_key, delta, uncovered, runtime)| {
+                let delta_norm = delta as f64 / delta_scale;
+                let uncovered_norm = uncovered as f64 / uncovered_scale;
+                let runtime_norm = (runtime / runtime_scale).max(f64::EPSILON);
+                let score = ((self.coverage_config.score_delta_weight * delta_norm)
+                    + (self.coverage_config.score_uncovered_weight * uncovered_norm))
+                    / runtime_norm;
+                (child_key, score)
+            })
+            .collect();
+
+        scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut selected: HashSet<HarnessKey> = HashSet::new();
+        for (child_key, _) in scored_candidates.into_iter().take(k) {
+            selected.insert(child_key);
+        }
+        let forced_count = force_selected.len();
+        for child_key in force_selected {
+            selected.insert(child_key);
+        }
+
+        for child_key in children {
+            if self.statuses.get(child_key) != Some(&VerificationStatus::Success) {
+                continue;
+            }
+            if !selected.contains(child_key) {
+                self.pruned_reasons.entry(child_key.clone()).or_insert(SkipReason::NotInTopK);
+            }
+        }
+
+        SelectionSummary { selected: selected.into_iter().collect(), forced_count, k }
+    }
+
+    pub fn pending_harnesses(&self) -> Vec<&'a HarnessMetadata> {
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+
+        let mut record_pending = |harness: &'a HarnessMetadata| {
+            if seen.insert(harness as *const HarnessMetadata) {
+                pending.push(harness);
+            }
+        };
+
+        let mut ready_heap = self.ready.clone();
+        while let Some(Reverse(entry)) = ready_heap.pop() {
+            if self.completed.contains(&entry.key) {
+                continue;
+            }
+            record_pending(entry.harness);
+        }
+
+        for harness in self.fallback.iter().copied() {
+            record_pending(harness);
+        }
+
+        pending
+    }
+
+    pub fn abandon_inflight(&mut self, harness: &'a HarnessMetadata) {
+        self.key_by_ptr.remove(&(harness as *const _));
+    }
+
+    pub fn mark_target_timed_out(&mut self, target: Option<usize>) {
+        if self.timed_out_targets.insert(target) {
+            for (key, node) in &self.nodes {
+                if node.target == target && !self.completed.contains(key) {
+                    self.pruned_reasons.entry(key.clone()).or_insert(SkipReason::TargetTimeout);
+                }
+            }
+            let keys: Vec<HarnessKey> = self
+                .nodes
+                .iter()
+                .filter_map(
+                    |(key, node)| {
+                        if node.target == target { Some(key.clone()) } else { None }
+                    },
+                )
+                .collect();
+            for key in keys {
+                self.completed.insert(key);
+            }
+        }
+    }
+
+    pub fn skip_reasons_for(
+        &self,
+        harnesses: &[&'a HarnessMetadata],
+    ) -> HashMap<*const HarnessMetadata, String> {
+        let mut reasons = HashMap::new();
+        for harness in harnesses {
+            let ptr = *harness as *const _;
+            if let Some(reason) = self.skip_reason_for_harness(harness) {
+                reasons.insert(ptr, reason);
+            }
+        }
+        reasons
+    }
+
+    fn skip_reason_for_harness(&self, harness: &'a HarnessMetadata) -> Option<String> {
+        let key = match self.key_by_harness_ptr.get(&(harness as *const _)) {
+            Some(key) => key,
+            None => return Some(SkipReason::Untracked.as_str()),
+        };
+        if self.completed.contains(key) {
+            return None;
+        }
+        if let Some(reason) = self.pruned_reasons.get(key) {
+            return Some(reason.as_str());
+        }
+
+        let mut visiting = HashSet::new();
+        if let Some(reason) = self.skip_reason_for_key(key, &mut visiting) {
+            return Some(reason.as_str());
+        }
+        Some(SkipReason::Unknown.as_str())
+    }
+
+    fn skip_reason_for_key(
+        &self,
+        key: &HarnessKey,
+        visiting: &mut HashSet<HarnessKey>,
+    ) -> Option<SkipReason> {
+        if !visiting.insert(key.clone()) {
+            return None;
+        }
+
+        let result = if !self.coverage_config.pruning_mode.pruning_disabled()
+            && matches!(self.statuses.get(key), Some(VerificationStatus::Failure))
+        {
+            Some(SkipReason::AncestorFailure)
+        } else if let Some(reason) = self.pruned_reasons.get(key) {
+            Some(SkipReason::AncestorPruned(reason.as_str()))
+        } else {
+            let Some(node) = self.nodes.get(key) else {
+                visiting.remove(key);
+                return Some(SkipReason::Unknown);
+            };
+            if node.parents.is_empty() {
+                None
+            } else {
+                let mut saw_unpruned_parent = false;
+                let mut pruned_reason = None;
+                for parent_key in &node.parents {
+                    match self.skip_reason_for_key(parent_key, visiting) {
+                        Some(SkipReason::AncestorFailure) => {
+                            pruned_reason = Some(SkipReason::AncestorFailure);
+                            break;
+                        }
+                        Some(reason @ SkipReason::AncestorPruned(_)) => {
+                            if pruned_reason.is_none() {
+                                pruned_reason = Some(reason);
+                            }
+                        }
+                        Some(SkipReason::Unknown) => {}
+                        None => {
+                            saw_unpruned_parent = true;
+                        }
+                        Some(other) => {
+                            if pruned_reason.is_none() {
+                                pruned_reason = Some(other);
+                            }
+                        }
+                    }
+                }
+                if matches!(pruned_reason, Some(SkipReason::AncestorFailure)) {
+                    pruned_reason
+                } else if saw_unpruned_parent {
+                    None
+                } else {
+                    pruned_reason
+                }
+            }
+        };
+
+        visiting.remove(key);
+        result
+    }
+
+    pub fn target_for_harness(&self, harness: &'a HarnessMetadata) -> Option<Option<usize>> {
+        let key = self.key_by_harness_ptr.get(&(harness as *const _))?;
+        self.nodes.get(key).map(|node| node.target)
+    }
+
+    pub fn coverage_summary(&self) -> Vec<CoverageSummary> {
+        match self.coverage_config.coverage_scope {
+            SynthCoverageScope::Global => self
+                .coverage_history
+                .get(&None)
+                .map(|history| {
+                    vec![CoverageSummary {
+                        target: None,
+                        covered_cnt: history.covered_count(),
+                        uncovered_cnt: history.uncovered_count(),
+                    }]
+                })
+                .unwrap_or_default(),
+            SynthCoverageScope::Target => {
+                let mut summary: Vec<CoverageSummary> = self
+                    .coverage_history
+                    .iter()
+                    .map(|(target, history)| CoverageSummary {
+                        target: *target,
+                        covered_cnt: history.covered_count(),
+                        uncovered_cnt: history.uncovered_count(),
+                    })
+                    .collect();
+                summary.sort_by(|a, b| match (a.target, b.target) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                });
+                summary
+            }
+        }
+    }
+
+    pub fn coverage_details(&self) -> HashMap<Option<usize>, CoverageHistory> {
+        match self.coverage_config.coverage_scope {
+            SynthCoverageScope::Global => self
+                .coverage_history
+                .get(&None)
+                .cloned()
+                .map(|history| HashMap::from([(None, history)]))
+                .unwrap_or_default(),
+            SynthCoverageScope::Target => self.coverage_history.clone(),
+        }
+    }
+
+    pub fn coverage_scope(&self) -> SynthCoverageScope {
+        self.coverage_config.coverage_scope
+    }
+
+    pub fn timeout_pruning_enabled(&self) -> bool {
+        self.coverage_config.pruning_mode.timeout_pruning_enabled()
+    }
+
+    pub fn snapshot(&self) -> SynthTreeSnapshot {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|(key, node)| SynthTreeNode {
+                id: key.id(),
+                pretty_name: node.harness.pretty_name.clone(),
+                target: node.target,
+                parent: node.parent.as_ref().map(|parent| parent.id()),
+                children: node.children.iter().map(|child| child.id()).collect(),
+            })
+            .collect();
+        SynthTreeSnapshot { nodes }
+    }
+
+    pub fn harness_ids(&self) -> HashMap<*const HarnessMetadata, String> {
+        self.key_by_harness_ptr.iter().map(|(ptr, key)| (*ptr, key.id())).collect()
+    }
+
+    pub fn coverage_stats_by_harness(
+        &self,
+    ) -> HashMap<*const HarnessMetadata, HarnessCoverageStats> {
+        let mut map = HashMap::new();
+        for (key, stats) in &self.coverage_stats {
+            if let Some(node) = self.nodes.get(key) {
+                map.insert(node.harness as *const _, stats.clone());
+            }
+        }
+        map
+    }
+}
+
+pub(crate) fn build_synth_harness_scheduler<'a>(
+    harnesses: &[&'a HarnessMetadata],
+    include_untracked: bool,
+    coverage_config: SynthCoverageConfig,
+) -> Option<SynthSchedulerPlan<'a>> {
+    if harnesses.is_empty() {
+        debug!("No harnesses provided; skipping synthesized harness scheduler");
+        return None;
+    }
+
+    let metadata_dirs = synthesized_metadata_dirs();
+    if metadata_dirs.is_empty() {
+        debug!("No synthesized metadata directories found; skipping synthesized harness scheduler");
+        return None;
+    }
+
+    let sequences = load_synthesized_sequence_metadata(&metadata_dirs);
+    if sequences.is_empty() {
+        debug!("No synthesized sequences loaded; skipping synthesized harness scheduler");
+        return None;
+    }
+
+    let mut harness_map: HashMap<HarnessKey, &HarnessMetadata> = HashMap::new();
+    let mut fallback: VecDeque<&HarnessMetadata> = VecDeque::new();
+    let mut considered: Vec<&HarnessMetadata> = Vec::new();
+
+    for harness in harnesses {
+        if let Some(key) = identify_harness(&sequences, harness) {
+            if harness_map.insert(key.clone(), *harness).is_some() {
+                debug!(
+                    ?key,
+                    harness = %harness.pretty_name,
+                    "Duplicate synthesized harness key detected; falling back to default scheduling"
+                );
+                return None;
+            }
+            considered.push(*harness);
+        } else {
+            if include_untracked {
+                fallback.push_back(*harness);
+                considered.push(*harness);
+            } else {
+                debug!(
+                    harness = %harness.pretty_name,
+                    "Ignoring harness that is not represented in synthesized metadata"
+                );
+            }
+        }
+    }
+
+    if harness_map.is_empty() {
+        debug!("No synthesized harnesses matched; skipping synthesized harness scheduler");
+        return None;
+    }
+
+    let nodes = build_synth_nodes(&sequences, &harness_map);
+    if nodes.is_empty() {
+        debug!("No synthesized harness nodes constructed; skipping synthesized harness scheduler");
+        return None;
+    }
+
+    debug!(
+        scheduled = nodes.len(),
+        total = harnesses.len(),
+        "Constructed synthesized harness scheduler"
+    );
+
+    Some(SynthSchedulerPlan {
+        scheduler: SynthHarnessScheduler::new(nodes, fallback, coverage_config),
+        harnesses: considered,
+    })
+}
+
+pub(crate) fn filter_harnesses_by_target<'a>(
+    harnesses: &[&'a HarnessMetadata],
+    target_idx: usize,
+) -> Vec<&'a HarnessMetadata> {
+    let metadata_dirs = synthesized_metadata_dirs();
+    if metadata_dirs.is_empty() {
+        return vec![];
+    }
+
+    let sequences = load_synthesized_sequence_metadata(&metadata_dirs);
+    if sequences.is_empty() {
+        return vec![];
+    }
+
+    harnesses
+        .iter()
+        .copied()
+        .filter_map(|harness| {
+            let key = identify_harness(&sequences, harness)?;
+            sequences
+                .get(&key)
+                .and_then(|sequence| sequence.target)
+                .filter(|target| *target == target_idx)
+                .map(|_| harness)
+        })
+        .collect()
+}
+
+fn synthesized_metadata_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(env_dir) = std::env::var("KANI_SYNTHESIZED_META_DIR") {
+        let candidate = PathBuf::from(env_dir);
+        if candidate.is_dir() {
+            debug!(?candidate, "Adding synthesized metadata directory from environment");
+            dirs.push(candidate);
+        } else {
+            debug!(
+                ?candidate,
+                "Skipping non-existent synthesized metadata directory from environment"
+            );
+        }
+    }
+
+    if let Ok(root) = current_dir() {
+        let default = root.join("varies_meta");
+        if default.is_dir() && !dirs.iter().any(|dir| dir == &default) {
+            debug!(?default, "Adding default synthesized metadata directory");
+            dirs.push(default);
+        }
+    }
+
+    dirs
+}
+
+fn load_synthesized_sequence_metadata(dirs: &[PathBuf]) -> HashMap<HarnessKey, SynthSequence> {
+    let mut sequences = HashMap::new();
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                debug!(?dir, ?error, "Failed to read synthesized metadata directory");
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    debug!(?dir, ?error, "Failed to access synthesized metadata entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !stem.ends_with("_api_sequences") {
+                continue;
+            }
+            let Some(dataset) = stem.strip_suffix("_api_sequences").filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            info!(?path, ?dataset, "Loading synthesized harness metadata file");
+            match from_json::<Vec<RawSynthSequence>>(&path) {
+                Ok(raw_sequences) => {
+                    for raw in raw_sequences {
+                        let RawSynthSequence {
+                            index,
+                            predecessor: raw_predecessor,
+                            parents: raw_parents,
+                            cost: raw_cost,
+                            target,
+                            is_basic,
+                            successors,
+                        } = raw;
+                        let key = HarnessKey::new(dataset.to_string(), index);
+                        let predecessor = if is_basic || raw_predecessor == index {
+                            None
+                        } else {
+                            Some(raw_predecessor)
+                        };
+                        let predecessors =
+                            sanitize_predecessors(predecessor, raw_parents, index, is_basic);
+                        let cost = sanitize_cost(raw_cost);
+                        sequences.insert(
+                            key,
+                            SynthSequence {
+                                initial_cost: cost,
+                                predecessor: predecessors.first().copied(),
+                                predecessors,
+                                target,
+                                successors: sanitize_successors(successors, index),
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    debug!(?path, ?error, "Failed to parse synthesized harness metadata file");
+                }
+            }
+        }
+    }
+
+    sequences
+}
+
+fn identify_harness(
+    sequences: &HashMap<HarnessKey, SynthSequence>,
+    harness: &HarnessMetadata,
+) -> Option<HarnessKey> {
+    debug!("Identifying synthesized harness for {}", harness.pretty_name);
+
+    if let Some(stem) = Path::new(&harness.original_file).file_stem().and_then(|s| s.to_str()) {
+        if let Some(key) =
+            identify_harness_from_dataset_prefix(sequences, stem, &harness.crate_name)
+        {
+            return Some(key);
+        }
+        if let Some(key) = identify_harness_from_sequence_datasets(sequences, stem) {
+            return Some(key);
+        }
+    }
+
+    if let Some((dataset, index)) = parse_dataset_and_index_from_filename(&harness.original_file) {
+        let key = HarnessKey::new(dataset.clone(), index);
+        if sequences.contains_key(&key) {
+            return Some(key);
+        }
+    }
+
+    let candidate_index = parse_index_from_filename(&harness.original_file)
+        .or_else(|| parse_trailing_number(&harness.pretty_name));
+    if let Some(index) = candidate_index {
+        let mut matched: Option<HarnessKey> = None;
+        for key in sequences.keys().filter(|key| key.index == index) {
+            match &mut matched {
+                None => matched = Some(key.clone()),
+                Some(existing) if existing == key => {}
+                Some(_) => {
+                    // Ambiguous match across datasets; abort.
+                    return None;
+                }
+            }
+        }
+        if let Some(key) = matched {
+            return Some(key);
+        }
+    }
+
+    None
+}
+
+const SYNTHESIZED_HARNESS_PREFIXES: [&str; 2] = ["test_", "kani_test_"];
+
+fn identify_harness_from_dataset_prefix(
+    sequences: &HashMap<HarnessKey, SynthSequence>,
+    stem: &str,
+    dataset: &str,
+) -> Option<HarnessKey> {
+    if dataset.is_empty() {
+        return None;
+    }
+    for prefix in SYNTHESIZED_HARNESS_PREFIXES {
+        if let Some(after_prefix) = stem.strip_prefix(prefix) {
+            if let Some(index_str) = after_prefix.strip_prefix(dataset) {
+                if index_str.is_empty() {
+                    continue;
+                }
+                if let Ok(index) = index_str.parse::<usize>() {
+                    let key = HarnessKey::new(dataset.to_string(), index);
+                    if sequences.contains_key(&key) {
+                        return Some(key);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn identify_harness_from_sequence_datasets(
+    sequences: &HashMap<HarnessKey, SynthSequence>,
+    stem: &str,
+) -> Option<HarnessKey> {
+    let mut datasets: Vec<&str> = sequences.keys().map(|key| key.dataset.as_str()).collect();
+    datasets.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    datasets.dedup();
+    for dataset in datasets {
+        if let Some(key) = identify_harness_from_dataset_prefix(sequences, stem, dataset) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+fn parse_dataset_and_index_from_filename(path: &str) -> Option<(String, usize)> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let digits_len = stem.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+
+    let index_str = &stem[stem.len() - digits_len..];
+    let prefix = &stem[..stem.len() - digits_len];
+    let dataset = prefix.strip_prefix("test_").unwrap_or(prefix);
+    if dataset.is_empty() {
+        return None;
+    }
+
+    let index = index_str.parse().ok()?;
+    Some((dataset.to_string(), index))
+}
+
+fn parse_index_from_filename(path: &str) -> Option<usize> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    parse_trailing_number(stem)
+}
+
+fn parse_trailing_number(value: &str) -> Option<usize> {
+    let trimmed = value.rsplit("::").next().unwrap_or(value);
+    let digits_len = trimmed.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let number = &trimmed[trimmed.len() - digits_len..];
+    number.parse().ok()
+}
+
+fn sanitize_cost(cost: f64) -> f64 {
+    if cost.is_finite() && !cost.is_sign_negative() { cost } else { 0.0 }
+}
+
+fn sanitize_successors(successors: Vec<usize>, index: usize) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    successors
+        .into_iter()
+        .filter(|successor| *successor != index && seen.insert(*successor))
+        .collect()
+}
+
+fn sanitize_predecessors(
+    predecessor: Option<usize>,
+    predecessors: Vec<usize>,
+    index: usize,
+    is_basic: bool,
+) -> Vec<usize> {
+    if is_basic {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut sanitized = Vec::new();
+    if let Some(predecessor) = predecessor.filter(|predecessor| *predecessor != index) {
+        seen.insert(predecessor);
+        sanitized.push(predecessor);
+    }
+    for predecessor in predecessors {
+        if predecessor != index && seen.insert(predecessor) {
+            sanitized.push(predecessor);
+        }
+    }
+    sanitized
+}
+
+fn build_synth_nodes<'a>(
+    sequences: &HashMap<HarnessKey, SynthSequence>,
+    harness_map: &HashMap<HarnessKey, &'a HarnessMetadata>,
+) -> HashMap<HarnessKey, SynthNode<'a>> {
+    let mut nodes = HashMap::new();
+
+    for (key, harness) in harness_map {
+        if sequences.contains_key(key) {
+            let target = sequences.get(key).and_then(|sequence| sequence.target);
+            nodes.insert(
+                key.clone(),
+                SynthNode {
+                    harness: *harness,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![],
+                    target,
+                    depth: usize::MAX,
+                },
+            );
+        }
+    }
+
+    let mut parent_map: HashMap<HarnessKey, HashSet<HarnessKey>> = HashMap::new();
+    let mut child_map: HashMap<HarnessKey, HashSet<HarnessKey>> = HashMap::new();
+    let mut primary_parent_map: HashMap<HarnessKey, HarnessKey> = HashMap::new();
+
+    for key in nodes.keys().cloned().collect::<Vec<_>>() {
+        if let Some(sequence) = sequences.get(&key) {
+            if let Some(predecessor) = sequence.predecessor {
+                let parent_key = key.with_index(predecessor);
+                if nodes.contains_key(&parent_key) {
+                    parent_map.entry(key.clone()).or_default().insert(parent_key.clone());
+                    child_map.entry(parent_key.clone()).or_default().insert(key.clone());
+                    primary_parent_map.insert(key.clone(), parent_key);
+                }
+            }
+            for predecessor in &sequence.predecessors {
+                let parent_key = key.with_index(*predecessor);
+                if nodes.contains_key(&parent_key) {
+                    parent_map.entry(key.clone()).or_default().insert(parent_key.clone());
+                    child_map.entry(parent_key).or_default().insert(key.clone());
+                }
+            }
+        }
+    }
+
+    let parent_keys: Vec<HarnessKey> = nodes.keys().cloned().collect();
+    for parent_key in parent_keys.iter() {
+        let Some(sequence) = sequences.get(parent_key) else { continue };
+        for child_idx in &sequence.successors {
+            let child_key = parent_key.with_index(*child_idx);
+            if !nodes.contains_key(&child_key) {
+                continue;
+            }
+            if let Some(existing) = primary_parent_map.get(&child_key) {
+                if existing != parent_key {
+                    debug!(
+                        ?child_key,
+                        existing_parent = ?existing,
+                        new_parent = ?parent_key,
+                        "Synthesized harness metadata reports conflicting predecessor; \
+                         using successor link"
+                    );
+                }
+            } else {
+                primary_parent_map.insert(child_key.clone(), parent_key.clone());
+            }
+            parent_map.entry(child_key.clone()).or_default().insert(parent_key.clone());
+            child_map.entry(parent_key.clone()).or_default().insert(child_key);
+        }
+    }
+
+    for (child_key, parents) in &parent_map {
+        if let Some(child_node) = nodes.get_mut(child_key) {
+            let mut sorted_parents = parents.iter().cloned().collect::<Vec<_>>();
+            sorted_parents.sort();
+            child_node.parent = primary_parent_map
+                .get(child_key)
+                .cloned()
+                .or_else(|| sorted_parents.first().cloned());
+            child_node.parents = sorted_parents;
+        }
+    }
+
+    for parent_key in parent_keys {
+        if let Some(parent_node) = nodes.get_mut(&parent_key) {
+            let mut child_keys =
+                child_map.remove(&parent_key).unwrap_or_default().into_iter().collect::<Vec<_>>();
+            child_keys.sort();
+            for child_key in child_keys {
+                if !parent_node.children.contains(&child_key) {
+                    parent_node.children.push(child_key);
+                }
+            }
+        }
+    }
+
+    let root_keys: Vec<HarnessKey> = nodes
+        .iter_mut()
+        .filter_map(|(key, node)| {
+            if node.parents.is_empty() {
+                node.depth = 0;
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut pending = VecDeque::from(root_keys);
+    while let Some(parent_key) = pending.pop_front() {
+        let Some((parent_depth, children)) =
+            nodes.get(&parent_key).map(|node| (node.depth, node.children.clone()))
+        else {
+            continue;
+        };
+
+        for child_key in children {
+            if let Some(child_node) = nodes.get_mut(&child_key) {
+                let next_depth = parent_depth.saturating_add(1);
+                if next_depth < child_node.depth {
+                    child_node.depth = next_depth;
+                    pending.push_back(child_key);
+                }
+            }
+        }
+    }
+
+    for node in nodes.values_mut() {
+        if node.depth == usize::MAX {
+            node.depth = 0;
+        }
+    }
+
+    nodes
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use crate::call_cbmc::VerificationStatus;
+    use crate::coverage::cov_results::CoverageRegion;
+    use crate::metadata::tests::mock_proof_harness;
+    use std::collections::{HashMap, HashSet};
+
+    fn coverage_input(
+        covered_regions: impl IntoIterator<Item = CoverageRegion>,
+        uncovered_regions: impl IntoIterator<Item = CoverageRegion>,
+    ) -> HarnessCoverageInput {
+        let covered_regions: HashSet<_> = covered_regions.into_iter().collect();
+        let uncovered_regions: HashSet<_> = uncovered_regions.into_iter().collect();
+        HarnessCoverageInput { covered_regions, uncovered_regions }
+    }
+
+    fn region(file: &str, start: (u32, u32), end: (u32, u32)) -> CoverageRegion {
+        CoverageRegion { file: file.to_string(), start, end }
+    }
+
+    fn test_coverage_config(pruning_mode: SynthPruningMode) -> SynthCoverageConfig {
+        SynthCoverageConfig::new(
+            2,
+            4,
+            0,
+            0,
+            2.0,
+            1.0,
+            1.0,
+            SynthCoverageScope::Global,
+            pruning_mode,
+        )
+    }
+
+    #[test]
+    fn coverage_history_interns_files_and_restores_regions() {
+        let mut history = CoverageHistory::default();
+        let region_a = region("src/lib.rs", (1, 1), (1, 5));
+        let region_b = region("src/lib.rs", (2, 1), (2, 5));
+        let region_c = region("src/main.rs", (3, 1), (3, 5));
+
+        assert!(history.insert_covered(&region_a));
+        assert!(history.insert_uncovered(&region_b));
+        assert!(history.insert_uncovered(&region_c));
+        assert!(history.remove_uncovered(&region_b));
+
+        assert_eq!(history.files.len(), 2);
+        assert_eq!(history.covered_count(), 1);
+        assert_eq!(history.uncovered_count(), 1);
+        assert!(history.contains_covered(&region_a));
+        assert!(!history.contains_covered(&region_b));
+
+        let mut covered = history.covered_regions();
+        covered.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
+        assert_eq!(covered, vec![region_a.clone()]);
+
+        let mut uncovered = history.uncovered_regions();
+        uncovered.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
+        assert_eq!(uncovered, vec![region_c]);
+    }
+
+    #[test]
+    fn scheduler_traverses_a_target_in_bfs_order() {
+        let harness_root = mock_proof_harness("root", None, Some("dataset"), None);
+        let harness_child_a = mock_proof_harness("child_a", None, Some("dataset"), None);
+        let harness_child_b = mock_proof_harness("child_b", None, Some("dataset"), None);
+        let harness_grandchild = mock_proof_harness("grandchild", None, Some("dataset"), None);
+
+        let root_key = HarnessKey::new("dataset".to_string(), 0);
+        let child_a_key = HarnessKey::new("dataset".to_string(), 1);
+        let child_b_key = HarnessKey::new("dataset".to_string(), 2);
+        let grandchild_key = HarnessKey::new("dataset".to_string(), 3);
+
+        let nodes = HashMap::from([
+            (
+                root_key.clone(),
+                SynthNode {
+                    harness: &harness_root,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![child_a_key.clone(), child_b_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                child_a_key.clone(),
+                SynthNode {
+                    harness: &harness_child_a,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![grandchild_key.clone()],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                child_b_key.clone(),
+                SynthNode {
+                    harness: &harness_child_b,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                grandchild_key,
+                SynthNode {
+                    harness: &harness_grandchild,
+                    parent: Some(child_a_key.clone()),
+                    parents: vec![child_a_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 2,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::Coverage);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+        let child_a_covered =
+            CoverageRegion { file: "src/lib.rs".to_string(), start: (1, 1), end: (1, 2) };
+        let child_a_uncovered =
+            CoverageRegion { file: "src/lib.rs".to_string(), start: (1, 3), end: (1, 4) };
+        let child_b_covered =
+            CoverageRegion { file: "src/lib.rs".to_string(), start: (2, 1), end: (2, 2) };
+
+        let root = scheduler.next().unwrap();
+        assert_eq!(root.pretty_name, "root");
+        scheduler.record_result(
+            root,
+            0.0,
+            VerificationStatus::Success,
+            Some(coverage_input([], [])),
+        );
+
+        let child_a = scheduler.next().unwrap();
+        assert_eq!(child_a.pretty_name, "child_a");
+        scheduler.record_result(
+            child_a,
+            0.0,
+            VerificationStatus::Success,
+            Some(coverage_input([child_a_covered], [child_a_uncovered])),
+        );
+
+        let child_b = scheduler.next().unwrap();
+        assert_eq!(child_b.pretty_name, "child_b");
+        scheduler.record_result(
+            child_b,
+            0.0,
+            VerificationStatus::Success,
+            Some(coverage_input([child_b_covered], [])),
+        );
+
+        let grandchild = scheduler.next().unwrap();
+        assert_eq!(grandchild.pretty_name, "grandchild");
+    }
+
+    #[test]
+    fn scheduler_traverses_targets_globally_by_depth() {
+        let harness_root_a = mock_proof_harness("root_a", None, Some("dataset"), None);
+        let harness_child_a = mock_proof_harness("child_a", None, Some("dataset"), None);
+        let harness_root_b = mock_proof_harness("root_b", None, Some("dataset"), None);
+
+        let root_a_key = HarnessKey::new("dataset".to_string(), 0);
+        let child_a_key = HarnessKey::new("dataset".to_string(), 1);
+        let root_b_key = HarnessKey::new("dataset".to_string(), 2);
+
+        let nodes = HashMap::from([
+            (
+                root_a_key.clone(),
+                SynthNode {
+                    harness: &harness_root_a,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![child_a_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                child_a_key,
+                SynthNode {
+                    harness: &harness_child_a,
+                    parent: Some(root_a_key.clone()),
+                    parents: vec![root_a_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                root_b_key,
+                SynthNode {
+                    harness: &harness_root_b,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![],
+                    target: Some(1),
+                    depth: 0,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::FailureOnly);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+
+        let root_a = scheduler.next().unwrap();
+        assert_eq!(root_a.pretty_name, "root_a");
+        scheduler.record_result(root_a, 0.0, VerificationStatus::Success, None);
+
+        let root_b = scheduler.next().unwrap();
+        assert_eq!(root_b.pretty_name, "root_b");
+        scheduler.record_result(root_b, 0.0, VerificationStatus::Success, None);
+
+        let child_a = scheduler.next().unwrap();
+        assert_eq!(child_a.pretty_name, "child_a");
+    }
+
+    #[test]
+    fn scheduler_blocks_shared_child_when_any_parent_fails() {
+        let harness_root_a = mock_proof_harness("root_a", None, Some("dataset"), None);
+        let harness_root_b = mock_proof_harness("root_b", None, Some("dataset"), None);
+        let harness_shared = mock_proof_harness("shared", None, Some("dataset"), None);
+
+        let root_a_key = HarnessKey::new("dataset".to_string(), 0);
+        let root_b_key = HarnessKey::new("dataset".to_string(), 1);
+        let shared_key = HarnessKey::new("dataset".to_string(), 2);
+
+        let nodes = HashMap::from([
+            (
+                root_a_key.clone(),
+                SynthNode {
+                    harness: &harness_root_a,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                root_b_key.clone(),
+                SynthNode {
+                    harness: &harness_root_b,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                shared_key,
+                SynthNode {
+                    harness: &harness_shared,
+                    parent: Some(root_a_key.clone()),
+                    parents: vec![root_b_key.clone(), root_a_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::FailureOnly);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+
+        let first_root = scheduler.next().unwrap();
+        assert!(matches!(first_root.pretty_name.as_str(), "root_a" | "root_b"));
+        scheduler.record_result(
+            first_root,
+            0.0,
+            if first_root.pretty_name == "root_a" {
+                VerificationStatus::Failure
+            } else {
+                VerificationStatus::Success
+            },
+            None,
+        );
+
+        let second_root = scheduler.next().unwrap();
+        assert!(matches!(second_root.pretty_name.as_str(), "root_a" | "root_b"));
+        assert_ne!(first_root.pretty_name, second_root.pretty_name);
+        scheduler.record_result(
+            second_root,
+            0.0,
+            if second_root.pretty_name == "root_a" {
+                VerificationStatus::Failure
+            } else {
+                VerificationStatus::Success
+            },
+            None,
+        );
+
+        let skipped_reason = scheduler.skip_reason_for_harness(&harness_shared);
+        assert_eq!(skipped_reason, Some("ancestor_failure".to_string()));
+        assert!(scheduler.next().is_none());
+    }
+
+    #[test]
+    fn scheduler_releases_shared_child_after_last_parent_succeeds() {
+        let harness_root_a = mock_proof_harness("root_a", None, Some("dataset"), None);
+        let harness_root_b = mock_proof_harness("root_b", None, Some("dataset"), None);
+        let harness_shared = mock_proof_harness("shared", None, Some("dataset"), None);
+
+        let root_a_key = HarnessKey::new("dataset".to_string(), 0);
+        let root_b_key = HarnessKey::new("dataset".to_string(), 1);
+        let shared_key = HarnessKey::new("dataset".to_string(), 2);
+
+        let nodes = HashMap::from([
+            (
+                root_a_key.clone(),
+                SynthNode {
+                    harness: &harness_root_a,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                root_b_key.clone(),
+                SynthNode {
+                    harness: &harness_root_b,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                shared_key,
+                SynthNode {
+                    harness: &harness_shared,
+                    parent: Some(root_a_key.clone()),
+                    parents: vec![root_a_key.clone(), root_b_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::FailureOnly);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+
+        let first_root = scheduler.next().unwrap();
+        assert!(matches!(first_root.pretty_name.as_str(), "root_a" | "root_b"));
+        scheduler.record_result(first_root, 0.0, VerificationStatus::Success, None);
+        assert_eq!(scheduler.skip_reason_for_harness(&harness_shared), Some("unknown".to_string()));
+
+        let second_root = scheduler.next().unwrap();
+        assert!(matches!(second_root.pretty_name.as_str(), "root_a" | "root_b"));
+        assert_ne!(first_root.pretty_name, second_root.pretty_name);
+        scheduler.record_result(second_root, 0.0, VerificationStatus::Success, None);
+
+        let shared = scheduler.next().unwrap();
+        assert_eq!(shared.pretty_name, "shared");
+    }
+
+    #[test]
+    fn disabled_pruning_keeps_child_after_failed_parent() {
+        let harness_root = mock_proof_harness("root", None, Some("dataset"), None);
+        let harness_child = mock_proof_harness("child", None, Some("dataset"), None);
+
+        let root_key = HarnessKey::new("dataset".to_string(), 0);
+        let child_key = HarnessKey::new("dataset".to_string(), 1);
+
+        let nodes = HashMap::from([
+            (
+                root_key.clone(),
+                SynthNode {
+                    harness: &harness_root,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![child_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                child_key,
+                SynthNode {
+                    harness: &harness_child,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::Disabled);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+
+        let root = scheduler.next().unwrap();
+        assert_eq!(root.pretty_name, "root");
+        scheduler.record_result(root, 0.0, VerificationStatus::Failure, None);
+
+        assert_eq!(scheduler.skip_reason_for_harness(&harness_child), Some("unknown".to_string()));
+        let child = scheduler.next().unwrap();
+        assert_eq!(child.pretty_name, "child");
+    }
+
+    #[test]
+    fn disabled_pruning_releases_shared_child_after_all_parents_finish() {
+        let harness_root_a = mock_proof_harness("root_a", None, Some("dataset"), None);
+        let harness_root_b = mock_proof_harness("root_b", None, Some("dataset"), None);
+        let harness_shared = mock_proof_harness("shared", None, Some("dataset"), None);
+
+        let root_a_key = HarnessKey::new("dataset".to_string(), 0);
+        let root_b_key = HarnessKey::new("dataset".to_string(), 1);
+        let shared_key = HarnessKey::new("dataset".to_string(), 2);
+
+        let nodes = HashMap::from([
+            (
+                root_a_key.clone(),
+                SynthNode {
+                    harness: &harness_root_a,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                root_b_key.clone(),
+                SynthNode {
+                    harness: &harness_root_b,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![shared_key.clone()],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                shared_key,
+                SynthNode {
+                    harness: &harness_shared,
+                    parent: Some(root_a_key.clone()),
+                    parents: vec![root_a_key.clone(), root_b_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let coverage_config = test_coverage_config(SynthPruningMode::Disabled);
+        let mut scheduler = SynthHarnessScheduler::new(nodes, VecDeque::new(), coverage_config);
+
+        let first_root = scheduler.next().unwrap();
+        assert!(matches!(first_root.pretty_name.as_str(), "root_a" | "root_b"));
+        scheduler.record_result(first_root, 0.0, VerificationStatus::Failure, None);
+        assert_eq!(scheduler.skip_reason_for_harness(&harness_shared), Some("unknown".to_string()));
+
+        let second_root = scheduler.next().unwrap();
+        assert!(matches!(second_root.pretty_name.as_str(), "root_a" | "root_b"));
+        assert_ne!(first_root.pretty_name, second_root.pretty_name);
+        scheduler.record_result(second_root, 0.0, VerificationStatus::Success, None);
+
+        let shared = scheduler.next().unwrap();
+        assert_eq!(shared.pretty_name, "shared");
+    }
+
+    #[test]
+    fn successor_selection_uses_runtime_aware_score() {
+        let root = mock_proof_harness("root", None, Some("dataset"), None);
+        let fast = mock_proof_harness("fast", None, Some("dataset"), None);
+        let slow = mock_proof_harness("slow", None, Some("dataset"), None);
+        let medium = mock_proof_harness("medium", None, Some("dataset"), None);
+        let low = mock_proof_harness("low", None, Some("dataset"), None);
+
+        let root_key = HarnessKey::new("dataset".to_string(), 0);
+        let fast_key = HarnessKey::new("dataset".to_string(), 1);
+        let slow_key = HarnessKey::new("dataset".to_string(), 2);
+        let medium_key = HarnessKey::new("dataset".to_string(), 3);
+        let low_key = HarnessKey::new("dataset".to_string(), 4);
+
+        let nodes = HashMap::from([
+            (
+                root_key.clone(),
+                SynthNode {
+                    harness: &root,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![
+                        fast_key.clone(),
+                        slow_key.clone(),
+                        medium_key.clone(),
+                        low_key.clone(),
+                    ],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                fast_key.clone(),
+                SynthNode {
+                    harness: &fast,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                slow_key.clone(),
+                SynthNode {
+                    harness: &slow,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                medium_key.clone(),
+                SynthNode {
+                    harness: &medium,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                low_key.clone(),
+                SynthNode {
+                    harness: &low,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let mut scheduler = SynthHarnessScheduler::new(
+            nodes,
+            VecDeque::new(),
+            test_coverage_config(SynthPruningMode::Coverage),
+        );
+
+        for (key, delta, uncovered, runtime) in [
+            (fast_key.clone(), 10, 10, 1.0),
+            (slow_key.clone(), 10, 10, 10.0),
+            (medium_key.clone(), 5, 5, 1.0),
+            (low_key.clone(), 1, 1, 1.0),
+        ] {
+            scheduler.statuses.insert(key.clone(), VerificationStatus::Success);
+            scheduler.runtimes_secs.insert(key.clone(), runtime);
+            scheduler.coverage_stats.insert(
+                key,
+                HarnessCoverageStats {
+                    covered_cnt: delta,
+                    uncovered_cnt: uncovered,
+                    uncovered_filtered_cnt: uncovered,
+                    delta_covered_cnt: delta,
+                },
+            );
+        }
+
+        let summary = scheduler.select_children_for_expansion(&[
+            fast_key.clone(),
+            slow_key.clone(),
+            medium_key.clone(),
+            low_key.clone(),
+        ]);
+
+        assert!(summary.selected.contains(&fast_key));
+        assert!(summary.selected.contains(&medium_key));
+        assert!(!summary.selected.contains(&slow_key));
+        assert!(!summary.selected.contains(&low_key));
+        assert_eq!(
+            scheduler.pruned_reasons.get(&slow_key).map(SkipReason::as_str),
+            Some("not_in_top_k".to_string())
+        );
+    }
+
+    #[test]
+    fn successor_selection_uses_strict_thresholds_and_force_retain() {
+        let root = mock_proof_harness("root", None, Some("dataset"), None);
+        let zero_delta = mock_proof_harness("zero_delta", None, Some("dataset"), None);
+        let zero_uncovered = mock_proof_harness("zero_uncovered", None, Some("dataset"), None);
+        let ratio_eq = mock_proof_harness("ratio_eq", None, Some("dataset"), None);
+        let ratio_above = mock_proof_harness("ratio_above", None, Some("dataset"), None);
+
+        let root_key = HarnessKey::new("dataset".to_string(), 0);
+        let zero_delta_key = HarnessKey::new("dataset".to_string(), 1);
+        let zero_uncovered_key = HarnessKey::new("dataset".to_string(), 2);
+        let ratio_eq_key = HarnessKey::new("dataset".to_string(), 3);
+        let ratio_above_key = HarnessKey::new("dataset".to_string(), 4);
+
+        let nodes = HashMap::from([
+            (
+                root_key.clone(),
+                SynthNode {
+                    harness: &root,
+                    parent: None,
+                    parents: vec![],
+                    children: vec![
+                        zero_delta_key.clone(),
+                        zero_uncovered_key.clone(),
+                        ratio_eq_key.clone(),
+                        ratio_above_key.clone(),
+                    ],
+                    target: Some(0),
+                    depth: 0,
+                },
+            ),
+            (
+                zero_delta_key.clone(),
+                SynthNode {
+                    harness: &zero_delta,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                zero_uncovered_key.clone(),
+                SynthNode {
+                    harness: &zero_uncovered,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                ratio_eq_key.clone(),
+                SynthNode {
+                    harness: &ratio_eq,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+            (
+                ratio_above_key.clone(),
+                SynthNode {
+                    harness: &ratio_above,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            ),
+        ]);
+
+        let mut scheduler = SynthHarnessScheduler::new(
+            nodes,
+            VecDeque::new(),
+            test_coverage_config(SynthPruningMode::Coverage),
+        );
+        for key in [
+            zero_delta_key.clone(),
+            zero_uncovered_key.clone(),
+            ratio_eq_key.clone(),
+            ratio_above_key.clone(),
+        ] {
+            scheduler.statuses.insert(key.clone(), VerificationStatus::Success);
+            scheduler.runtimes_secs.insert(key, 1.0);
+        }
+        scheduler.coverage_stats.insert(
+            zero_delta_key.clone(),
+            HarnessCoverageStats {
+                covered_cnt: 1,
+                uncovered_cnt: 1,
+                uncovered_filtered_cnt: 1,
+                delta_covered_cnt: 0,
+            },
+        );
+        scheduler.coverage_stats.insert(
+            zero_uncovered_key.clone(),
+            HarnessCoverageStats {
+                covered_cnt: 1,
+                uncovered_cnt: 0,
+                uncovered_filtered_cnt: 0,
+                delta_covered_cnt: 1,
+            },
+        );
+        scheduler.coverage_stats.insert(
+            ratio_eq_key.clone(),
+            HarnessCoverageStats {
+                covered_cnt: 1,
+                uncovered_cnt: 2,
+                uncovered_filtered_cnt: 2,
+                delta_covered_cnt: 2,
+            },
+        );
+        scheduler.coverage_stats.insert(
+            ratio_above_key.clone(),
+            HarnessCoverageStats {
+                covered_cnt: 1,
+                uncovered_cnt: 3,
+                uncovered_filtered_cnt: 3,
+                delta_covered_cnt: 2,
+            },
+        );
+
+        let summary = scheduler.select_children_for_expansion(&[
+            zero_delta_key.clone(),
+            zero_uncovered_key.clone(),
+            ratio_eq_key.clone(),
+            ratio_above_key.clone(),
+        ]);
+
+        assert_eq!(summary.forced_count, 1);
+        assert!(summary.selected.contains(&ratio_eq_key));
+        assert!(summary.selected.contains(&ratio_above_key));
+        assert_eq!(
+            scheduler.pruned_reasons.get(&zero_delta_key).map(SkipReason::as_str),
+            Some("delta_covered_threshold".to_string())
+        );
+        assert_eq!(
+            scheduler.pruned_reasons.get(&zero_uncovered_key).map(SkipReason::as_str),
+            Some("uncovered_cnt_threshold".to_string())
+        );
+    }
+
+    #[test]
+    fn successor_selection_keeps_quarter_of_successors_with_min_two() {
+        let mut nodes = HashMap::new();
+        let root = mock_proof_harness("root", None, Some("dataset"), None);
+        let root_key = HarnessKey::new("dataset".to_string(), 0);
+        let mut child_keys = Vec::new();
+
+        for index in 1..=12 {
+            let harness = Box::leak(Box::new(mock_proof_harness(
+                format!("child_{index}").as_str(),
+                None,
+                Some("dataset"),
+                None,
+            )));
+            let key = HarnessKey::new("dataset".to_string(), index);
+            child_keys.push(key.clone());
+            nodes.insert(
+                key.clone(),
+                SynthNode {
+                    harness,
+                    parent: Some(root_key.clone()),
+                    parents: vec![root_key.clone()],
+                    children: vec![],
+                    target: Some(0),
+                    depth: 1,
+                },
+            );
+        }
+        nodes.insert(
+            root_key,
+            SynthNode {
+                harness: &root,
+                parent: None,
+                parents: vec![],
+                children: child_keys.clone(),
+                target: Some(0),
+                depth: 0,
+            },
+        );
+
+        let mut scheduler = SynthHarnessScheduler::new(
+            nodes,
+            VecDeque::new(),
+            test_coverage_config(SynthPruningMode::Coverage),
+        );
+        for (offset, key) in child_keys.iter().enumerate() {
+            scheduler.statuses.insert(key.clone(), VerificationStatus::Success);
+            scheduler.runtimes_secs.insert(key.clone(), 1.0 + offset as f64);
+            scheduler.coverage_stats.insert(
+                key.clone(),
+                HarnessCoverageStats {
+                    covered_cnt: 1,
+                    uncovered_cnt: 1,
+                    uncovered_filtered_cnt: 1,
+                    delta_covered_cnt: 1,
+                },
+            );
+        }
+
+        let summary = scheduler.select_children_for_expansion(&child_keys);
+        assert_eq!(summary.k, 3);
+        assert_eq!(summary.selected.len(), 3);
     }
 }
 
@@ -167,25 +2846,73 @@ impl Artifact {
     pub fn try_from(artifact: &Artifact, typ: ArtifactType) -> Result<Self> {
         Self::try_new(&convert_type(&artifact.path, artifact.typ, typ), typ)
     }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.path.clone()
+    }
 }
 
 /// Generate a project using `cargo`.
 /// Accept a boolean to build as many targets as possible. The number of failures in that case can
 /// be collected from the project.
 pub fn cargo_project(session: &mut KaniSession, keep_going: bool) -> Result<Project> {
-    let outputs = session.cargo_build(keep_going)?;
-    if session.args.no_codegen {
-        info_operation(
-            "info:",
-            "Compilation succeeded up until codegen. Skipping codegen because of `--no-codegen` option. Rerun without `--no-codegen` to perform codegen.",
-        );
-        return Ok(Project::default());
+    let mut skipper: Option<HarnessSkipper> = None;
+    loop {
+        match session.cargo_build(keep_going) {
+            Ok(outputs) => {
+                if session.args.no_codegen {
+                    info_operation(
+                        "info:",
+                        "Compilation succeeded up until codegen. Skipping codegen because of `--no-codegen` option. Rerun without `--no-codegen` to perform codegen.",
+                    );
+                    return Ok(Project::default());
+                }
+                let outdir = outputs.outdir.canonicalize()?;
+                let metadata = outputs
+                    .metadata
+                    .iter()
+                    .map(|md_file| from_json(md_file))
+                    .collect::<Result<Vec<_>>>()?;
+                return Project::try_new(
+                    session,
+                    outdir,
+                    None,
+                    metadata,
+                    Some(outputs.cargo_metadata),
+                );
+            }
+            Err(err) => {
+                if !session.args.error_recovery {
+                    return Err(err);
+                }
+
+                let skipper = skipper.get_or_insert_with(HarnessSkipper::new);
+                let mut handled = false;
+                if let Some(failure) = err.downcast_ref::<BuildFailure>() {
+                    for source in &failure.failed_sources {
+                        match skipper.skip(source) {
+                            Ok(true) => {
+                                handled = true;
+                            }
+                            Ok(false) => {}
+                            Err(skip_err) => {
+                                warn!(
+                                    ?source,
+                                    ?skip_err,
+                                    "Failed to skip harness source after compilation failure"
+                                );
+                            }
+                        }
+                    }
+                }
+                if handled {
+                    continue;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
     }
-    let outdir = outputs.outdir.canonicalize()?;
-    // For the MIR Linker we know there is only one metadata per crate. Use that in our favor.
-    let metadata =
-        outputs.metadata.iter().map(|md_file| from_json(md_file)).collect::<Result<Vec<_>>>()?;
-    Project::try_new(session, outdir, None, metadata, Some(outputs.cargo_metadata))
 }
 
 /// Generate a project directly using `kani-compiler` on a single crate.
@@ -250,7 +2977,8 @@ impl<'a> StandaloneProjectBuilder<'a> {
         let result =
             Project::try_new(self.session, self.outdir, Some(self.input), vec![metadata], None);
         if let Ok(project) = &result {
-            self.session.record_temporary_files(&project.artifacts);
+            let artifacts = project.current_artifacts();
+            self.session.record_temporary_files(&artifacts);
         }
         result
     }

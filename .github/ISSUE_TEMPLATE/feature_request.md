@@ -1,30 +1,15 @@
 ---
 name: Feature Request
-about: Request a new feature or improvement for Kani
+about: Propose a varies-kani improvement
 title: ''
-labels: "[C] Feature / Enhancement"
+labels: ''
 assignees: ''
-
 ---
 
-<!--
-If this is a security issue, please report it following the
-[security reporting procedure](https://github.com/model-checking/kani/security/policy).
--->
+## Use Case
 
-<!--
-Thank you for requesting a Kani feature!
-Please include the following information if it applies to your case:
--->
-Requested feature:
-Use case:
-Link to relevant documentation (Rust reference, Nomicon, RFC):
+## Proposed Change
 
-Test case:
-<!--
-If the test-case is small, please post it here.
-Otherwise, please attach the relevant files to this issue.
--->
-```rust
-<code>
-```
+Describe any effects on synthesized metadata, verification, or pruning.
+
+## Example

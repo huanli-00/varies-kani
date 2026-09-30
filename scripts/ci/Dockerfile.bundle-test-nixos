@@ -24,18 +24,18 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /tmp/kani
 COPY ./tests ./tests
-COPY ./kani-latest-x86_64-unknown-linux-gnu.tar.gz ./
-# Very awkward glob (not regex!) to get `kani-verifier-*` and not `kani-verifier-*.crate`
-COPY ./target/package/kani-verifier-*[^e] ./kani-verifier
-RUN cargo install --path ./kani-verifier
-RUN cargo-kani setup --use-local-bundle ./kani-latest-x86_64-unknown-linux-gnu.tar.gz
+COPY ./varies-kani-latest-x86_64-unknown-linux-gnu.tar.gz ./
+# Very awkward glob (not regex!) to get `varies-kani-verifier-*` and not `varies-kani-verifier-*.crate`
+COPY ./target/package/varies-kani-verifier-*[^e] ./varies-kani-verifier
+RUN cargo install --path ./varies-kani-verifier
+RUN cargo-varies-kani setup --use-local-bundle ./varies-kani-latest-x86_64-unknown-linux-gnu.tar.gz
 
 # Temporary hack: nix-shell causes problems when trying to run these with 'docker run'
 # like we do for other tests, so we've imported these into the dockerfile for now
 # until everything can be replaced with 'self-test':
 # https://github.com/model-checking/kani/issues/1246
-RUN cargo kani --version
-RUN (cd /tmp/kani/tests/cargo-kani/simple-lib && cargo kani)
-RUN (cd /tmp/kani/tests/cargo-kani/simple-visualize && cargo kani)
-RUN (cd /tmp/kani/tests/cargo-kani/build-rs-works && cargo kani)
-RUN cargo-kani setup --use-local-bundle ./kani-latest-x86_64-unknown-linux-gnu.tar.gz
+RUN cargo varies-kani --version
+RUN (cd /tmp/kani/tests/cargo-kani/simple-lib && cargo varies-kani)
+RUN (cd /tmp/kani/tests/cargo-kani/simple-visualize && cargo varies-kani)
+RUN (cd /tmp/kani/tests/cargo-kani/build-rs-works && cargo varies-kani)
+RUN cargo-varies-kani setup --use-local-bundle ./varies-kani-latest-x86_64-unknown-linux-gnu.tar.gz

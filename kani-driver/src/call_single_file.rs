@@ -179,6 +179,17 @@ impl KaniSession {
             flags.push("--prove-safety-only".into());
         }
 
+        if self.args.skip_unsupported_check {
+            flags.push("--skip-unsupported-check".into());
+        }
+
+        if self.args.assert_as_assume {
+            flags.push("--assert-as-assume".into());
+            if let Some(prefix) = &self.args.assert_as_assume_skip_prefix {
+                flags.push(format!("--assert-as-assume-skip-prefix {prefix}").into());
+            }
+        }
+
         flags.extend(self.args.common_args.unstable_features.as_arguments().map(KaniArg::from));
 
         flags

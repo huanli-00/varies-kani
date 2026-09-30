@@ -7,7 +7,7 @@
 FROM ubuntu:20.04
 ENV DEBIAN_FRONTEND=noninteractive \
     DEBCONF_NONINTERACTIVE_SEEN=true \
-    KANI_HOME="/tmp"
+    VARIES_KANI_HOME="/tmp"
 RUN apt-get update && \
     apt-get install -y curl build-essential && \
     curl -sSf https://sh.rustup.rs | sh -s -- -y
@@ -15,8 +15,8 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /tmp/kani
 COPY ./tests ./tests
-COPY ./kani-latest-*.tar.gz ./
-# Very awkward glob (not regex!) to get `kani-verifier-*` and not `kani-verifier-*.crate`
-COPY ./target/package/kani-verifier-*[^e] ./kani-verifier
-RUN cargo install --path ./kani-verifier
-RUN cargo-kani setup --use-local-bundle ./kani-latest-*.tar.gz
+COPY ./varies-kani-latest-*.tar.gz ./
+# Very awkward glob (not regex!) to get `varies-kani-verifier-*` and not `varies-kani-verifier-*.crate`
+COPY ./target/package/varies-kani-verifier-*[^e] ./varies-kani-verifier
+RUN cargo install --path ./varies-kani-verifier
+RUN cargo-varies-kani setup --use-local-bundle ./varies-kani-latest-*.tar.gz

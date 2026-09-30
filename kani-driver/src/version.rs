@@ -3,7 +3,7 @@
 
 use crate::InvocationType;
 
-const KANI_RUST_VERIFIER: &str = "Kani Rust Verifier";
+const KANI_RUST_VERIFIER: &str = "Varies Kani Rust Verifier";
 /// We assume this is the same as the `kani-verifier` version, but we should
 /// make sure it's enforced through CI:
 /// <https://github.com/model-checking/kani/issues/2626>

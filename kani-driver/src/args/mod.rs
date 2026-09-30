@@ -11,6 +11,7 @@ pub mod std_args;
 
 use self::common::*;
 use crate::args::cargo::CargoTargetArgs;
+use crate::project::{SynthCoverageScope, SynthPruningMode};
 use crate::util::warning;
 use cargo::CargoCommonArgs;
 use clap::builder::{PossibleValue, TypedValueParser};
@@ -141,7 +142,7 @@ impl From<Timeout> for Duration {
 #[derive(Debug, clap::Parser)]
 #[command(
     version,
-    name = "kani",
+    name = "varies-kani",
     about = "Verify a single Rust crate. For more information, see https://github.com/model-checking/kani",
     args_override_self = true,
     subcommand_negates_reqs = true,
@@ -180,7 +181,7 @@ pub enum StandaloneSubcommand {
 #[derive(Debug, clap::Parser)]
 #[command(
     version,
-    name = "cargo-kani",
+    name = "cargo-varies-kani",
     about = "Verify a Rust crate. For more information, see https://github.com/model-checking/kani",
     args_override_self = true
 )]
@@ -212,6 +213,14 @@ pub enum CargoKaniSubcommand {
 #[derive(Debug, clap::Args)]
 #[clap(next_help_heading = "Verification Options")]
 pub struct VerificationArgs {
+    /// Treat assertions as assumptions to avoid reporting assertion-based panics.
+    #[arg(long, hide_short_help = true)]
+    pub assert_as_assume: bool,
+
+    /// Preserve assertions whose messages start with this prefix when using --assert-as-assume.
+    #[arg(long, value_name = "PREFIX", requires = "assert_as_assume", hide_short_help = true)]
+    pub assert_as_assume_skip_prefix: Option<String>,
+
     /// Link external C files referenced by Rust code.
     /// This is an experimental feature and requires `-Z c-ffi` to be used
     #[arg(long, hide = true, num_args(1..))]
@@ -266,15 +275,31 @@ pub struct VerificationArgs {
     #[arg(long, hide_short_help = true)]
     pub gen_c: bool,
 
+    /// Enable experimental error recovery that skips synthesized harnesses which fail to compile.
+    #[arg(long, hide_short_help = true)]
+    pub error_recovery: bool,
+
     /// If specified, only run harnesses that match this filter. This option can be provided
     /// multiple times, which will run all tests matching any of the filters.
     /// If used with --exact, the harness filter will only match the exact fully qualified name of a harness.
     #[arg(long = "harness", num_args(1), value_name = "HARNESS_FILTER")]
     pub harnesses: Vec<String>,
 
+    /// Emit synthesized harness HTML reports into `kani_results`.
+    #[arg(long, hide_short_help = true)]
+    pub html_output: bool,
+
     /// Timeout for each harness with optional suffix ('s': seconds, 'm': minutes, 'h': hours). Default is seconds. This option is experimental and requires `-Z unstable-options` to be used.
     #[arg(long)]
     pub harness_timeout: Option<Timeout>,
+
+    /// Global timeout for the entire verification session with optional suffix ('s', 'm', 'h'). This option is experimental and requires `-Z unstable-options`.
+    #[arg(long = "global-timeout")]
+    pub global_timeout: Option<Timeout>,
+
+    /// Timeout for each synthesized target with optional suffix ('s', 'm', 'h'). This option is experimental and requires `-Z unstable-options`.
+    #[arg(long = "target-timeout")]
+    pub target_timeout: Option<Timeout>,
 
     /// Do not error out for crates containing `global_asm!`.
     /// This option may impact the soundness of the analysis and may cause false proofs and/or counterexamples
@@ -335,6 +360,10 @@ pub struct VerificationArgs {
     #[arg(long, hide_short_help = true)]
     pub prove_safety_only: bool,
 
+    /// Treat unsupported checks as unreachable instead of failing verification.
+    #[arg(long = "skip-unsupported-check")]
+    pub skip_unsupported_check: bool,
+
     /// Randomize the layout of structures. This option can help catching code that relies on
     /// a specific layout chosen by the compiler that is not guaranteed to be stable in the future.
     /// If a value is given, it will be used as the seed for randomization
@@ -356,6 +385,45 @@ pub struct VerificationArgs {
     #[arg(long, value_parser = CbmcSolverValueParser::new(CbmcSolver::VARIANTS))]
     pub solver: Option<CbmcSolver>,
 
+    /// Coverage scope used by synthesized harness pruning: per-target or global across all targets.
+    #[arg(long, value_enum, default_value_t = SynthCoverageScope::Global, hide_short_help = true)]
+    pub synth_coverage_scope: SynthCoverageScope,
+
+    /// Minimum delta covered regions required to consider a successor for expansion.
+    #[arg(long, default_value_t = 0, hide_short_help = true)]
+    pub synth_delta_threshold: usize,
+
+    /// Pruning mode for synthesized harnesses:
+    /// `coverage` prunes on failure/timeout and coverage heuristics;
+    /// `failure-only` prunes on failure/timeout only (no coverage-based pruning);
+    /// `disabled` disables pruning entirely.
+    #[arg(long, value_enum, default_value_t = SynthPruningMode::Coverage, hide_short_help = true)]
+    pub synth_pruning: SynthPruningMode,
+
+    /// Weight assigned to normalized delta coverage in synthesized successor scoring.
+    #[arg(long, default_value_t = 1.0, hide_short_help = true)]
+    pub synth_score_delta_weight: f64,
+
+    /// Weight assigned to normalized filtered uncovered count in synthesized successor scoring.
+    #[arg(long, default_value_t = 1.0, hide_short_help = true)]
+    pub synth_score_uncovered_weight: f64,
+
+    /// Divisor used to compute successor expansion count: k = max(min, successor_cnt / divisor).
+    #[arg(long, default_value_t = 8, hide_short_help = true)]
+    pub synth_successor_k_divisor: usize,
+
+    /// Minimum number of successors to expand per predecessor in synthesized harness pruning.
+    #[arg(long, default_value_t = 2, hide_short_help = true)]
+    pub synth_successor_k_min: usize,
+
+    /// Minimum uncovered count required to consider a successor for expansion.
+    #[arg(long, default_value_t = 0, hide_short_help = true)]
+    pub synth_uncovered_cnt_threshold: usize,
+
+    /// Force-expand a successor when uncovered_ratio > threshold.
+    #[arg(long, default_value_t = 2.0, hide_short_help = true)]
+    pub synth_uncovered_ratio_threshold: f64,
+
     /// Synthesize loop contracts for all loops.
     #[arg(
         long,
@@ -368,6 +436,10 @@ pub struct VerificationArgs {
     /// Directory for all generated artifacts.
     #[arg(long)]
     pub target_dir: Option<PathBuf>,
+
+    /// Only verify synthesized harnesses whose metadata target index matches this value.
+    #[arg(long = "target-idx", value_name = "INDEX")]
+    pub target_idx: Option<usize>,
 
     /// Enable test function verification. Only use this option when the entry point is a test function
     #[arg(long)]
@@ -716,6 +788,16 @@ impl ValidateArgs for VerificationArgs {
             self.common_args.check_unstable(
                 self.harness_timeout.is_some(),
                 "harness-timeout",
+                UnstableFeature::UnstableOptions,
+            )?;
+            self.common_args.check_unstable(
+                self.global_timeout.is_some(),
+                "global-timeout",
+                UnstableFeature::UnstableOptions,
+            )?;
+            self.common_args.check_unstable(
+                self.target_timeout.is_some(),
+                "target-timeout",
                 UnstableFeature::UnstableOptions,
             )?;
             self.common_args.check_unstable(

@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 use tempfile::NamedTempFile;
+use tracing::{debug, info};
 
 impl KaniSession {
     /// The main driver for generating concrete playback unit tests and adding them to source code.
@@ -36,8 +37,8 @@ impl KaniSession {
             let harness_values = extract_harness_values(result_items);
 
             if harness_values.is_empty() {
-                println!(
-                    "WARNING: Kani could not produce a concrete playback for `{}` because there \
+                debug!(
+                    "Kani could not produce a concrete playback for `{}` because there \
                     were no failing panic checks or satisfiable cover statements.",
                     harness.pretty_name
                 )
@@ -61,16 +62,16 @@ impl KaniSession {
                         }
 
                         if !unit_tests.is_empty() {
-                            println!(
-                                "INFO: To automatically add the concrete playback unit test(s) to the \
+                            info!(
+                                "To automatically add the concrete playback unit test(s) to the \
                                  src code, run Kani with `--concrete-playback=inplace`.",
                             );
                         }
                     }
                     ConcretePlaybackMode::InPlace => {
                         if !self.args.common_args.quiet && !unit_tests.is_empty() {
-                            println!(
-                                "INFO: Now modifying the source code to include the concrete playback unit test:{}.",
+                            debug!(
+                                "Now modifying the source code to include the concrete playback unit test:{}.",
                                 unit_tests
                                     .iter()
                                     .map(|generated_unit_test| format!(
@@ -292,6 +293,7 @@ fn format_unit_test(
 
     let func_before_concrete_vals = [
         doc_str,
+        "#[cfg(kani)]".to_string(),
         "#[test]".to_string(),
         format!("fn {func_name}() {{"),
         format!("{:<4}let concrete_vals: Vec<Vec<u8>> = vec![", " "),
@@ -626,13 +628,14 @@ mod tests {
         ];
 
         assert_eq!(full_func[0], doc_str);
-        assert_eq!(full_func[1], "#[test]");
+        assert_eq!(full_func[1], "#[cfg(kani)]");
+        assert_eq!(full_func[2], "#[test]");
         assert_eq!(
             split_unit_test_name.before_hash,
             format!("kani_concrete_playback_{harness_name}")
         );
-        assert_eq!(full_func[2], format!("fn {}() {{", unit_test.name));
-        assert_eq!(full_func[3..], expected_after_func_name);
+        assert_eq!(full_func[3], format!("fn {}() {{", unit_test.name));
+        assert_eq!(full_func[4..], expected_after_func_name);
     }
 
     /// Generates a unit test and returns its hash.

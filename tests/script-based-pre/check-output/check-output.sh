@@ -73,19 +73,19 @@ rm -rf build
 cargo kani --target-dir build --gen-c -Z unstable-options >& kani.log || \
     { ret=$?; echo "== Failed to run Kani"; cat kani.log; rm kani.log; exit 1; }
 rm -f kani.log
-cd build/kani/${TARGET}/debug/deps/
+cd build/varies-kani/${TARGET}/debug/deps/
 
 mangled=$(ls multifile*main.c)
 if ! [ -e "${mangled}" ]
 then
-    echo "Error: no GotoC file found. Expected: build/kani/${TARGET}/debug/deps/multifile*main.c"
+    echo "Error: no GotoC file found. Expected: build/varies-kani/${TARGET}/debug/deps/multifile*main.c"
     exit 1
 fi
 
 demangled=$(ls multifile*main.demangled.c)
 if ! [ -e "${demangled}" ]
 then
-    echo "Error: no demangled GotoC file found. Expected build/kani/${TARGET}/debug/deps/multifile*main.demangled.c."
+    echo "Error: no demangled GotoC file found. Expected build/varies-kani/${TARGET}/debug/deps/multifile*main.demangled.c."
     exit 1
 fi
 

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KANI_DRIVER="$SCRIPT_DIR/../target/kani/bin/kani-driver"
+
+if [[ ! -x "$KANI_DRIVER" ]]; then
+    echo "Varies Kani is not built. Run 'cargo build-dev -- --release' in its repository." >&2
+    exit 1
+fi
+
+TOOLCHAIN="$(cd "$SCRIPT_DIR/.." && env -u RUSTUP_TOOLCHAIN rustup show active-toolchain)"
+TOOLCHAIN="${TOOLCHAIN%% *}"
+exec rustup run "$TOOLCHAIN" bash -c 'exec -a varies-kani "$@"' varies-kani "$KANI_DRIVER" "$@"

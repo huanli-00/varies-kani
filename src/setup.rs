@@ -1,7 +1,7 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! This module contains all first-time setup code done as part of `cargo kani setup`.
+//! First-time setup for `cargo varies-kani setup`.
 
 use std::env;
 use std::ffi::OsString;
@@ -18,39 +18,40 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Set by our `build.rs`, reflects the Rust target triple we're building for
 const TARGET: &str = env!("TARGET");
 
-/// The directory where Kani is installed, either:
-///  * (custom) `${KANI_HOME}/kani-<VERSION>` if the environment variable
-///    `KANI_HOME` is set.
-///  * (default) `${HOME}/.kani/kani-<VERSION>` where `HOME` is the canonical
-///    definition of home directory used by Cargo and rustup.
+/// Varies Kani uses its own installation root and ignores the upstream KANI_HOME.
+/// Defaults to `${HOME}/.varies-kani/varies-kani-<VERSION>`.
 pub fn kani_dir() -> Result<PathBuf> {
-    let kani_dir = match env::var("KANI_HOME") {
+    let kani_dir = match env::var("VARIES_KANI_HOME") {
         Ok(val) => custom_kani_dir(val),
         Err(_) => default_kani_dir()?,
     };
-    let kani_dir = kani_dir.join(format!("kani-{VERSION}"));
+    let kani_dir = installation_dir(&kani_dir);
     Ok(kani_dir)
 }
 
-/// Returns the custom Kani home directory: `${KANI_HOME}`
+fn installation_dir(base: &Path) -> PathBuf {
+    base.join(format!("varies-kani-{VERSION}"))
+}
+
+/// Returns the custom Varies Kani home directory: `${VARIES_KANI_HOME}`
 fn custom_kani_dir(path: String) -> PathBuf {
     // We don't check if it doesn't exist since we create it later
     PathBuf::from(path)
 }
 
-/// Returns the default Kani home directory: `${HOME}/.kani`
+/// Returns the default Varies Kani home directory: `${HOME}/.varies-kani`
 fn default_kani_dir() -> Result<PathBuf> {
     let home_dir = home::home_dir().expect("couldn't find home directory");
     if !home_dir.is_dir() {
         bail!("got home directory `{}` which isn't a directory", home_dir.display());
     }
-    let kani_dir = home_dir.join(".kani");
+    let kani_dir = home_dir.join(".varies-kani");
     Ok(kani_dir)
 }
 
 /// Fast check to see if we look setup already
 pub fn appears_setup() -> bool {
-    kani_dir().expect("couldn't find kani directory").exists()
+    validate_bundle(&kani_dir().expect("couldn't find kani directory")).is_ok()
 }
 
 // Ensure that the tar file does not exist, essentially using its presence
@@ -72,7 +73,7 @@ pub fn appears_incomplete() -> Option<PathBuf> {
     None
 }
 
-/// Sets up Kani by unpacking/installing to `~/.kani/kani-VERSION`
+/// Sets up Varies Kani in its separate installation directory.
 pub fn setup(
     use_local_bundle: Option<OsString>,
     use_local_toolchain: Option<OsString>,
@@ -80,29 +81,31 @@ pub fn setup(
     let kani_dir = kani_dir()?;
     let os = os_info::get();
 
-    println!("[0/5] Running Kani first-time setup...");
+    println!("[0/5] Running Varies Kani first-time setup...");
 
     println!("[1/5] Ensuring the existence of: {}", kani_dir.display());
     std::fs::create_dir_all(&kani_dir)?;
 
     setup_kani_bundle(&kani_dir, use_local_bundle)?;
 
+    validate_bundle(&kani_dir)?;
+
     setup_rust_toolchain(&kani_dir, use_local_toolchain)?;
 
     os_hacks::setup_os_hacks(&kani_dir, &os)?;
 
-    println!("[5/5] Successfully completed Kani first-time setup.");
+    println!("[5/5] Successfully completed Varies Kani first-time setup.");
 
     Ok(())
 }
 
 /// Download and unpack the Kani release bundle
 fn setup_kani_bundle(kani_dir: &Path, use_local_bundle: Option<OsString>) -> Result<()> {
-    // e.g. `~/.kani/`
+    // e.g. `~/.varies-kani/`
     let base_dir = kani_dir.parent().expect("No base directory?");
 
     if let Some(pathstr) = use_local_bundle {
-        println!("[2/5] Installing local Kani bundle: {}", pathstr.to_string_lossy());
+        println!("[2/5] Installing local Varies Kani bundle: {}", pathstr.to_string_lossy());
         let path = Path::new(&pathstr).canonicalize()?;
         // When given a local bundle, it's often "-latest" but we expect "-1.0" or something.
         // tar supports "stripping" the first directory from the bundle, so do that and
@@ -113,12 +116,10 @@ fn setup_kani_bundle(kani_dir: &Path, use_local_bundle: Option<OsString>) -> Res
             .arg(&path)
             .current_dir(kani_dir)
             .run()
-            .context(
-                "Failed to extract tar file, try removing Kani setup located in .kani in your home directory and restarting",
-            )?;
+            .context("Failed to extract Varies Kani bundle")?;
     } else {
         let filename = download_filename();
-        println!("[2/5] Downloading Kani release bundle: {}", &filename);
+        println!("[2/5] Downloading Varies Kani release bundle: {}", &filename);
         fail_if_unsupported_target()?;
         let bundle = base_dir.join(filename);
         Command::new("curl")
@@ -128,9 +129,23 @@ fn setup_kani_bundle(kani_dir: &Path, use_local_bundle: Option<OsString>) -> Res
             .run()
             .context("Failed to download Kani release bundle")?;
 
-        Command::new("tar").arg("zxf").arg(&bundle).current_dir(base_dir).run()?;
+        Command::new("tar")
+            .args(["--strip-components=1", "-zxf"])
+            .arg(&bundle)
+            .current_dir(kani_dir)
+            .run()?;
 
         std::fs::remove_file(bundle)?;
+    }
+    Ok(())
+}
+
+/// The bundle marker prevents an upstream Kani bundle from being used as this fork.
+fn validate_bundle(dir: &Path) -> Result<()> {
+    let version = std::fs::read_to_string(dir.join("varies-kani-version"))
+        .context("Expected a Varies Kani bundle containing varies-kani-version")?;
+    if version.trim() != VERSION {
+        bail!("Varies Kani bundle version {} does not match launcher {VERSION}", version.trim());
     }
     Ok(())
 }
@@ -190,7 +205,7 @@ fn setup_rust_toolchain(kani_dir: &Path, use_local_toolchain: Option<OsString>) 
 
 /// The filename of the release bundle
 fn download_filename() -> String {
-    format!("kani-{VERSION}-{TARGET}.tar.gz")
+    format!("varies-kani-{VERSION}-{TARGET}.tar.gz")
 }
 
 /// Get the version of rustc that is being used to setup kani by the user
@@ -216,9 +231,9 @@ fn get_rustc_version_from_local_toolchain(path: OsString) -> Result<String> {
 
 /// The download URL for this version of Kani
 fn download_url() -> String {
-    let tag: &str = &format!("kani-{VERSION}");
+    let tag: &str = &format!("varies-kani-{VERSION}");
     let file: &str = &download_filename();
-    format!("https://github.com/model-checking/kani/releases/download/{tag}/{file}")
+    format!("https://github.com/huanli-00/varies-kani/releases/download/{tag}/{file}")
 }
 
 /// Give users a better error message than "404" if we're on an unsupported platform.
@@ -243,4 +258,33 @@ fn symlink_rust_toolchain(toolchain: &Path, kani_dir: &Path) -> Result<()> {
     }
     std::os::unix::fs::symlink(toolchain, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installation_and_download_are_namespaced() {
+        assert_eq!(
+            installation_dir(Path::new("/tmp/shared")),
+            Path::new("/tmp/shared").join(format!("varies-kani-{VERSION}"))
+        );
+        assert_eq!(
+            download_url(),
+            format!(
+                "https://github.com/huanli-00/varies-kani/releases/download/varies-kani-{VERSION}/varies-kani-{VERSION}-{TARGET}.tar.gz"
+            )
+        );
+    }
+
+    #[test]
+    fn upstream_and_mismatched_bundles_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_bundle(dir.path()).is_err());
+        std::fs::write(dir.path().join("varies-kani-version"), "different-version").unwrap();
+        assert!(validate_bundle(dir.path()).is_err());
+        std::fs::write(dir.path().join("varies-kani-version"), VERSION).unwrap();
+        assert!(validate_bundle(dir.path()).is_ok());
+    }
 }

@@ -1,0 +1,25 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Verification
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        with:
+          os: ubuntu-24.04
+      - run: cargo test --locked -p varies-kani-verifier -p kani-driver
+      - run: cargo build-dev -- --release
+      - name: Verify synthesized fixture
+        working-directory: fixtures/synth-smoke
+        run: |
+          set -o pipefail
+          ../../scripts/cargo-varies-kani --synth-pruning disabled | tee verification.log
+          grep -F '2 successfully verified harnesses, 0 failures' verification.log

@@ -131,21 +131,6 @@ impl KaniSession {
     }
 }
 
-/// Sort harnesses such that for two harnesses in the same file, it is guaranteed that later
-/// appearing harnesses get processed earlier.
-/// This is necessary for the concrete playback feature (with in-place unit test modification)
-/// because it guarantees that injected unit tests will not change the location of to-be-processed harnesses.
-pub fn sort_harnesses_by_loc<'a>(harnesses: &[&'a HarnessMetadata]) -> Vec<&'a HarnessMetadata> {
-    let mut harnesses_clone = harnesses.to_vec();
-    harnesses_clone.sort_unstable_by(|harness1, harness2| {
-        harness1
-            .original_file
-            .cmp(&harness2.original_file)
-            .then(harness1.original_start_line.cmp(&harness2.original_start_line).reverse())
-    });
-    harnesses_clone
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;

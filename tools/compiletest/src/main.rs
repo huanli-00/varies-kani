@@ -50,13 +50,16 @@ fn main() {
 fn add_kani_to_path() {
     let cwd = env::current_dir().unwrap();
     let kani_bin = cwd.join("target").join("debug");
-    let kani_scripts = cwd.join("scripts");
+    // Upstream test fixtures use the original command names inside this test process only.
+    let kani_scripts = cwd.join("scripts/upstream");
+    let varies_scripts = cwd.join("scripts");
     unsafe {
         env::set_var(
             "PATH",
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 kani_scripts.display(),
+                varies_scripts.display(),
                 kani_bin.display(),
                 env::var("PATH").unwrap()
             ),

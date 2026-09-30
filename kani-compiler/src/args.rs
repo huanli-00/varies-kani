@@ -37,6 +37,12 @@ pub enum ReachabilityType {
 /// with. Usually stored in and accessible via [`crate::kani_queries::QueryDb`].
 #[derive(Debug, Default, Clone, clap::Parser)]
 pub struct Arguments {
+    /// Treat assertions as assumptions to avoid reporting assertion-based panics.
+    #[clap(long = "assert-as-assume")]
+    pub assert_as_assume: bool,
+    /// Preserve assertions whose messages start with this prefix when using --assert-as-assume.
+    #[clap(long = "assert-as-assume-skip-prefix", requires = "assert_as_assume")]
+    pub assert_as_assume_skip_prefix: Option<String>,
     /// Option used to disable asserting function contracts.
     #[clap(long)]
     pub no_assert_contracts: bool,
@@ -92,6 +98,9 @@ pub struct Arguments {
     #[clap(long, conflicts_with = "json_output")]
     /// Option name used to force logger to use color output. This doesn't work with --json-output.
     pub color_output: bool,
+    /// Treat unsupported checks as unreachable instead of failing verification.
+    #[clap(long = "skip-unsupported-check")]
+    pub skip_unsupported_check: bool,
     #[clap(long)]
     /// Pass the kani version to the compiler to ensure cache coherence.
     check_version: Option<String>,

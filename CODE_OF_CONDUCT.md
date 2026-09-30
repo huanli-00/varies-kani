@@ -11,4 +11,4 @@ This project has adopted the [Rust Code Of Conduct](https://www.rust-lang.org/po
 * Likewise any spamming, trolling, flaming, baiting or other attention-stealing behavior is not welcome.
 
 ## Reporting Code of Conduct Issues
-If you have witnessed or been subjected to a violation of the Code of Conduct, please send an email to kani-verifier-moderation@amazon.com. Your message will be handled in a secure and confidential manner.
+Report conduct violations to the varies-kani repository maintainers through their GitHub profiles. Avoid posting private details in public issues.

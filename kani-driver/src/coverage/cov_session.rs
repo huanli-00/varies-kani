@@ -10,6 +10,35 @@ use crate::harness_runner::HarnessResult;
 use crate::project::Project;
 use anyhow::{Result, bail};
 
+fn write_coverage_results(outdir: &std::path::Path, results: &[HarnessResult<'_>]) -> Result<()> {
+    let mut skipped_harnesses = Vec::new();
+
+    for harness_res in results {
+        let Some(cov_results) = harness_res.result.coverage_results.as_ref() else {
+            skipped_harnesses.push(harness_res.harness.pretty_name.clone());
+            continue;
+        };
+
+        let harness_name = harness_res.harness.mangled_name.clone();
+        let kaniraw_name = format!("{harness_name}_kaniraw");
+        let file_name = outdir.join(kaniraw_name).with_extension("json");
+        let mut cov_file = File::create(file_name)?;
+
+        let serialized_data = serde_json::to_string(cov_results)?;
+        cov_file.write_all(serialized_data.as_bytes())?;
+    }
+
+    if !skipped_harnesses.is_empty() {
+        eprintln!(
+            "[warn] Skipping coverage output for {} harness(es) with no coverage results: {}",
+            skipped_harnesses.len(),
+            skipped_harnesses.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 impl KaniSession {
     /// Saves metadata required for coverage-related features.
     /// At present, this metadata consists of the following:
@@ -34,7 +63,7 @@ impl KaniSession {
             .as_ref()
             .unwrap_or(&metadata.target_directory.clone().into())
             .clone()
-            .join("kani");
+            .join("varies-kani");
 
         let outdir = target_dir.join(build_target).join(format!("kanicov_{stamp}"));
 
@@ -94,7 +123,7 @@ impl KaniSession {
     pub fn save_coverage_results(
         &self,
         project: &Project,
-        results: &Vec<HarnessResult>,
+        results: &[HarnessResult<'_>],
         stamp: &String,
     ) -> Result<()> {
         if project.input.is_none() {
@@ -106,7 +135,7 @@ impl KaniSession {
 
     pub fn save_coverage_results_cargo(
         &self,
-        results: &Vec<HarnessResult>,
+        results: &[HarnessResult<'_>],
         stamp: &String,
     ) -> Result<()> {
         let build_target = env!("TARGET");
@@ -117,7 +146,7 @@ impl KaniSession {
             .as_ref()
             .unwrap_or(&metadata.target_directory.clone().into())
             .clone()
-            .join("kani");
+            .join("varies-kani");
 
         let outdir = target_dir.join(build_target).join(format!("kanicov_{stamp}"));
 
@@ -127,16 +156,7 @@ impl KaniSession {
             bail!("directory associated to coverage run does not exist")
         }
 
-        for harness_res in results {
-            let harness_name = harness_res.harness.mangled_name.clone();
-            let kaniraw_name = format!("{harness_name}_kaniraw");
-            let file_name = outdir.join(kaniraw_name).with_extension("json");
-            let mut cov_file = File::create(file_name)?;
-
-            let cov_results = &harness_res.result.coverage_results.clone().unwrap();
-            let serialized_data = serde_json::to_string(&cov_results)?;
-            cov_file.write_all(serialized_data.as_bytes())?;
-        }
+        write_coverage_results(&outdir, results)?;
 
         println!("[info] Coverage results saved to {}", &outdir.display());
         Ok(())
@@ -145,7 +165,7 @@ impl KaniSession {
     pub fn save_coverage_results_standalone(
         &self,
         project: &Project,
-        results: &Vec<HarnessResult>,
+        results: &[HarnessResult<'_>],
         stamp: &String,
     ) -> Result<()> {
         let input = project.input.clone().unwrap().canonicalize().unwrap();
@@ -158,19 +178,75 @@ impl KaniSession {
             bail!("directory associated to coverage run does not exist")
         }
 
-        for harness_res in results {
-            let harness_name = harness_res.harness.mangled_name.clone();
-            let kaniraw_name = format!("{harness_name}_kaniraw");
-            let file_name = outdir.join(kaniraw_name).with_extension("json");
-            let mut cov_file = File::create(file_name)?;
-
-            let cov_results = &harness_res.result.coverage_results.clone().unwrap();
-            let serialized_data = serde_json::to_string(&cov_results)?;
-            cov_file.write_all(serialized_data.as_bytes())?;
-        }
+        write_coverage_results(&outdir, results)?;
 
         println!("[info] Coverage results saved to {}", &outdir.display());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::call_cbmc::{FailedProperties, VerificationResult, VerificationStatus};
+    use crate::cbmc_output_parser::CheckStatus;
+    use crate::coverage::cov_results::{
+        CoverageCheck, CoverageRegion, CoverageResults, CoverageTerm,
+    };
+    use crate::metadata::tests::mock_proof_harness;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn sample_coverage_results() -> CoverageResults {
+        let check = CoverageCheck::new(
+            "harness_fn".to_string(),
+            CoverageTerm::Counter(0),
+            CoverageRegion { file: "src/lib.rs".to_string(), start: (1, 1), end: (1, 5) },
+            CheckStatus::Covered,
+        );
+
+        CoverageResults::new(BTreeMap::from([("src/lib.rs".to_string(), vec![check])]))
+    }
+
+    fn verification_result_with_coverage(
+        coverage_results: Option<CoverageResults>,
+    ) -> VerificationResult {
+        VerificationResult {
+            status: VerificationStatus::Success,
+            failed_properties: FailedProperties::None,
+            results: Ok(vec![]),
+            runtime: Duration::from_secs(0),
+            generated_concrete_test: false,
+            coverage_results,
+        }
+    }
+
+    #[test]
+    fn skips_harnesses_without_coverage_results() {
+        let tempdir = tempdir().unwrap();
+        let harness_without_coverage = mock_proof_harness("missing_cov", None, None, None);
+        let harness_with_coverage = mock_proof_harness("present_cov", None, None, None);
+        let results = vec![
+            HarnessResult {
+                harness: &harness_without_coverage,
+                result: verification_result_with_coverage(None),
+            },
+            HarnessResult {
+                harness: &harness_with_coverage,
+                result: verification_result_with_coverage(Some(sample_coverage_results())),
+            },
+        ];
+
+        write_coverage_results(tempdir.path(), &results).unwrap();
+
+        let written_file = tempdir.path().join("present_cov_kaniraw.json");
+        assert!(written_file.exists());
+        assert!(!tempdir.path().join("missing_cov_kaniraw.json").exists());
+
+        let saved_results: CoverageResults =
+            serde_json::from_reader(File::open(written_file).unwrap()).unwrap();
+        assert_eq!(saved_results.data.len(), 1);
     }
 }

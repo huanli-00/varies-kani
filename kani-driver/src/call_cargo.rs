@@ -17,13 +17,13 @@ use cargo_metadata::{
     Target, TargetKind,
 };
 use kani_metadata::{ArtifactType, CompilerArtifactStub};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
 use std::fs::{self, File};
 use std::io::IsTerminal;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use tracing::{debug, trace};
 
 /// The outputs of kani-compiler being invoked via cargo on a project.
@@ -35,6 +35,33 @@ pub struct CargoOutputs {
     pub metadata: Vec<Artifact>,
     /// Recording the cargo metadata from the build
     pub cargo_metadata: Metadata,
+}
+
+#[derive(Debug)]
+pub struct BuildFailure {
+    pub status: ExitStatus,
+    pub error_count: usize,
+    pub failed_sources: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for BuildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cargo build failed with status {} after {} compiler error(s)",
+            self.status, self.error_count
+        )
+    }
+}
+
+impl std::error::Error for BuildFailure {}
+
+#[derive(Debug)]
+pub struct BuildOutcome {
+    pub artifacts: Vec<RustcArtifact>,
+    pub failed_sources: Vec<PathBuf>,
+    pub error_count: usize,
+    pub status: ExitStatus,
 }
 
 impl KaniSession {
@@ -118,6 +145,7 @@ crate-type = ["lib"]
 
         Ok(self
             .run_build(cmd)?
+            .artifacts
             .into_iter()
             .filter_map(|artifact| {
                 if artifact.target.crate_types.contains(&CrateType::Lib)
@@ -141,7 +169,7 @@ crate-type = ["lib"]
             .as_ref()
             .unwrap_or(&metadata.target_directory.clone().into())
             .clone()
-            .join("kani");
+            .join("varies-kani");
         let outdir = target_dir.join(build_target).join("debug/deps");
 
         if self.args.force_build && target_dir.exists() {
@@ -282,12 +310,13 @@ crate-type = ["lib"]
 
     /// Run cargo and collect any error found.
     /// We also collect the metadata file generated during compilation if any.
-    fn run_build(&self, cargo_cmd: Command) -> Result<Vec<RustcArtifact>> {
+    fn run_build(&self, cargo_cmd: Command) -> Result<BuildOutcome> {
         let support_color = std::io::stdout().is_terminal();
         let mut artifacts = vec![];
         let mut cargo_process = self.run_piped(cargo_cmd)?;
         let reader = BufReader::new(cargo_process.stdout.take().unwrap());
         let mut error_count = 0;
+        let mut failed_sources: HashSet<PathBuf> = HashSet::new();
         for message in Message::parse_stream(reader) {
             let message = message.unwrap();
             match message {
@@ -297,6 +326,21 @@ crate-type = ["lib"]
                     }
                     DiagnosticLevel::Error => {
                         error_count += 1;
+                        for span in &msg.message.spans {
+                            if span.is_primary {
+                                let path = Path::new(&span.file_name);
+                                let absolute = if path.is_absolute() {
+                                    path.to_path_buf()
+                                } else if let Ok(current) = std::env::current_dir() {
+                                    current.join(path)
+                                } else {
+                                    path.to_path_buf()
+                                };
+                                let canonical =
+                                    absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
+                                failed_sources.insert(canonical);
+                            }
+                        }
                         print_msg(&msg.message, support_color)?;
                     }
                     DiagnosticLevel::Ice => {
@@ -336,10 +380,12 @@ crate-type = ["lib"]
             }
         }
         let status = cargo_process.wait()?;
-        if !status.success() {
-            bail!("Failed to execute cargo ({status}). Found {error_count} compilation errors.");
-        }
-        Ok(artifacts)
+        Ok(BuildOutcome {
+            artifacts,
+            failed_sources: failed_sources.into_iter().collect(),
+            error_count,
+            status,
+        })
     }
 
     /// Run cargo and collect any error found.
@@ -365,18 +411,26 @@ crate-type = ["lib"]
         }
 
         let compile_start = std::time::Instant::now();
-        let artifacts = self.run_build(cargo_cmd)?;
+        let outcome = self.run_build(cargo_cmd)?;
         if std::env::var("TIME_COMPILER").is_ok() {
             // conditionally print the compilation time for debugging & use by `compile-timer`
             // doesn't just use the existing `--debug` flag because the number of prints significantly affects performance
             println!("BUILT {} IN {:?}μs", target.name, compile_start.elapsed().as_micros());
         }
-        debug!(?artifacts, "run_build_target");
+        debug!(?outcome, "run_build_target");
+
+        if !outcome.status.success() {
+            return Err(anyhow::Error::new(BuildFailure {
+                status: outcome.status,
+                error_count: outcome.error_count,
+                failed_sources: outcome.failed_sources,
+            }));
+        }
 
         // We generate kani specific artifacts only for the build target. The build target is
         // always the last artifact generated in a build, and all the other artifacts are related
         // to dependencies or build scripts.
-        Ok(artifacts.into_iter().rev().find_map(|artifact| {
+        Ok(outcome.artifacts.into_iter().rev().find_map(|artifact| {
             if same_target(&artifact.target, target) { map_kani_artifact(artifact) } else { None }
         }))
     }

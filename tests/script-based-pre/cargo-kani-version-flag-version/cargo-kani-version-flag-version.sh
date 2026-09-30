@@ -4,13 +4,13 @@
 
 set -eu
 
-KANI_VERSION_CMD=`cargo kani --version`
+KANI_VERSION_CMD=`cargo varies-kani --version`
 KANI_VERSION_CMD_VERSION=`echo ${KANI_VERSION_CMD} | awk '{print $2}'`
 
 # Check that the version printed is the same. Note: We use `sed -n '1p'` instead
 # of `head -n 1` to avoid https://github.com/model-checking/kani/issues/2618
-KANI_CARGO_OUTPUT_HEAD=`cd dummy-project; cargo kani | sed -n '1p'`
-KANI_CARGO_OUTPUT_HEAD_VERSION=`echo ${KANI_CARGO_OUTPUT_HEAD} | awk '{print $4}'`
+KANI_CARGO_OUTPUT_HEAD=`cd dummy-project; cargo varies-kani | sed -n '1p'`
+KANI_CARGO_OUTPUT_HEAD_VERSION=`echo ${KANI_CARGO_OUTPUT_HEAD} | awk '{print $5}'`
 
 if [[ $KANI_VERSION_CMD_VERSION == $KANI_CARGO_OUTPUT_HEAD_VERSION ]]; then
     echo "success: version printed agrees"
@@ -19,7 +19,7 @@ else
     exit 1
 fi
 
-KANI_CARGO_OUTPUT_HEAD_MODE=`echo ${KANI_CARGO_OUTPUT_HEAD} | awk '{print $5,$6}'`
+KANI_CARGO_OUTPUT_HEAD_MODE=`echo ${KANI_CARGO_OUTPUT_HEAD} | awk '{print $6,$7}'`
 
 # Check that `(cargo plugin)` appears in the version line
 if [[ $KANI_CARGO_OUTPUT_HEAD_MODE == "(cargo plugin)" ]]; then

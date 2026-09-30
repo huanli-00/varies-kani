@@ -1,0 +1,16 @@
+[
+  {
+    "index": 0,
+    "predecessor": 0,
+    "is_basic": true,
+    "successor": [1],
+    "target": 0
+  },
+  {
+    "index": 1,
+    "predecessor": 0,
+    "is_basic": false,
+    "successor": [],
+    "target": 0
+  }
+]

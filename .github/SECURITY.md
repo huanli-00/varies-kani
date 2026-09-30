@@ -1,6 +1,9 @@
-If you think you have discovered a security issue related to Kani, **please write to us**  at kani-verifier-security@amazon.com; do **NOT** open a public issue. Along with your notification email, please provide any supporting material (proof-of-concept code, tool output, etc.) that would be useful in helping us understand the nature and severity of the security concern. Sensitive information can be encrypted using our [PGP key](https://github.com/model-checking/kani/blob/main/kani-verifier-security.public.key).
+# Security Reports
 
-We will send a non-automated acknowledgement email reply within 1 business day followed by an initial assessment of the issue within 5 business days. Subsequently, we will work in partnership with you to assess any impact of the issue and prepare a security advisory (including any patches with appropriate fix) as needed.
+Report vulnerabilities privately using
+[GitHub's vulnerability reporting page](https://github.com/huanli-00/varies-kani/security/advisories/new).
+Include the affected commit, reproducer, command, and impact.
+Do not publish sensitive details in a public issue.
 
-If we confirm that your report represents a security issue in Kani, we will work with you to agree on an embargo period (typically at least 2 weeks AFTER any necessary development time) which will provide enough time to test our proposed fix and develop patches prior to any broader or more public disclosure. At the end of the embargo period, Kani maintainers will publicly release information about the security issue together with the patches that mitigate it.
-
+Issues specific to upstream Kani can also be reported through
+[its security policy](https://github.com/model-checking/kani/security/policy).

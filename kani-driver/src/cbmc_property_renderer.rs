@@ -10,6 +10,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use rustc_demangle::demangle;
 use std::collections::HashMap;
+use tracing::Level;
 
 type CbmcAltDescriptions = HashMap<&'static str, Vec<(&'static str, Option<&'static str>)>>;
 
@@ -440,10 +441,12 @@ pub fn format_coverage(
 
     let verification_output =
         format_result(&non_coverage_checks, status, should_panic, failed_properties, show_checks);
-    let cov_results_intro = "Source-based code coverage results:";
-    let result = format!("{verification_output}\n{cov_results_intro}\n\n{cov_results}");
-
-    result
+    if tracing::enabled!(Level::DEBUG) {
+        let cov_results_intro = "Source-based code coverage results:";
+        format!("{verification_output}\n{cov_results_intro}\n\n{cov_results}")
+    } else {
+        verification_output
+    }
 }
 
 /// Attempts to build a message for a failed property with as much detailed

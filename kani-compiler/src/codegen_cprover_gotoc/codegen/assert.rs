@@ -67,6 +67,12 @@ pub enum PropertyClass {
     /// That is, they do not depend on special instrumentation that Kani performs that wouldn't
     /// otherwise be observable.
     Assertion,
+    /// Explicit (Rust) assertions declared with `assert` macros
+    ///
+    /// SPECIAL BEHAVIOR: Some developers may consider explicit assertions as kind of condition check, so these
+    /// assertions are not expected to result in verification failure.
+    /// Declare this class for more fine-grained control.
+    ExplicitAssertion,
     /// Another intrinsic check.
     ///
     /// SPECIAL BEHAVIOR: Same as SafetyCheck. TODO: Replace this with `SafetyCheck`.
@@ -125,6 +131,37 @@ impl GotocCtx<'_, '_> {
         Stmt::assume(cond, loc)
     }
 
+    /// Decide whether we should lower assertions to assumptions.
+    pub fn assert_as_assume_enabled(&self, property_class: &PropertyClass, msg: &str) -> bool {
+        if !self.queries.args().assert_as_assume {
+            return false;
+        }
+
+        // Treat "assertion failed: ..." (user-facing assertions inserted by Rust) the same as
+        // explicit assertions, but leave other assertion classes (e.g., overflow checks) untouched.
+        let is_user_assert = *property_class == PropertyClass::ExplicitAssertion
+            || (*property_class == PropertyClass::Assertion
+                && msg.starts_with("assertion failed:"));
+        if !is_user_assert {
+            return false;
+        }
+
+        if let Some(prefix) = &self.queries.args().assert_as_assume_skip_prefix {
+            // Reachability instrumentation adds a unique id prefix like "[<id>] ".
+            // Strip it so users can still guard messages with a custom prefix.
+            let msg = msg
+                .strip_prefix('[')
+                .and_then(|suffix| suffix.split_once(']').map(|(_, rest)| rest.trim_start()))
+                .unwrap_or(msg);
+            // User-supplied messages may be rendered with leading quotes (e.g., `"msg"`). Ignore them
+            // when matching the skip prefix so the check is based on the visible text.
+            let msg = msg.trim_start_matches('"');
+            !msg.starts_with(prefix)
+        } else {
+            true
+        }
+    }
+
     /// Generates a CBMC assertion, followed by an assumption of the same condition.
     pub fn codegen_assert_assume(
         &self,
@@ -133,7 +170,19 @@ impl GotocCtx<'_, '_> {
         message: &str,
         loc: Location,
     ) -> Stmt {
-        if property_class == PropertyClass::Assertion && self.queries.args().prove_safety_only {
+        if property_class == PropertyClass::UnsupportedConstruct
+            && self.queries.args().skip_unsupported_check
+        {
+            return Stmt::assume(cond, loc);
+        }
+
+        if self.assert_as_assume_enabled(&property_class, message) {
+            return Stmt::assume(cond, loc);
+        }
+
+        if matches!(property_class, PropertyClass::Assertion | PropertyClass::ExplicitAssertion)
+            && self.queries.args().prove_safety_only
+        {
             Stmt::assume(cond, loc)
         } else {
             let property_name = property_class.as_str();
@@ -237,9 +286,10 @@ impl GotocCtx<'_, '_> {
         // If there is one in the MIR, use it; otherwise, explain that we can't.
         assert!(!fargs.is_empty(), "Panic requires a string message");
         let msg = self.extract_const_message(&fargs[0]).unwrap_or(String::from(
-            "This is a placeholder message; Kani doesn't support message formatted at runtime",
+            "This is a placeholder panic message; Kani doesn't support message formatted at runtime",
         ));
-        self.codegen_fatal_error(PropertyClass::Assertion, &msg, span)
+        // self.codegen_fatal_error(PropertyClass::Assertion, &msg, span)
+        self.codegen_fatal_error(PropertyClass::ExplicitAssertion, &msg, span)
     }
 
     /// Kani does not currently support all MIR constructs.

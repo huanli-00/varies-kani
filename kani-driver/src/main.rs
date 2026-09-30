@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use autoharness::{autoharness_cargo, autoharness_standalone};
 use time::{OffsetDateTime, format_description};
 
@@ -41,7 +41,7 @@ mod util;
 mod version;
 
 /// The main function for the `kani-driver`.
-/// The driver can be invoked via `cargo kani` and `kani` commands, which determines what kind of
+/// The driver can be invoked via `cargo varies-kani` and `varies-kani`, which determines what kind of
 /// project should be verified.
 fn main() -> ExitCode {
     let invocation_type = determine_invocation_type(Vec::from_iter(std::env::args_os()));
@@ -128,12 +128,18 @@ fn standalone_main() -> Result<()> {
 /// Run verification on the given project.
 fn verify_project(project: Project, session: KaniSession) -> Result<()> {
     debug!(?project, "verify_project");
-    let harnesses = session.determine_targets(project.get_all_harnesses())?;
+    let mut harnesses = session.determine_targets(project.get_all_harnesses())?;
+    if let Some(target_idx) = session.args.target_idx {
+        harnesses = crate::project::filter_harnesses_by_target(&harnesses, target_idx);
+        if harnesses.is_empty() {
+            bail!("No synthesized harness matched target index `{target_idx}`.");
+        }
+    }
     debug!(n = harnesses.len(), ?harnesses, "verify_project");
 
     // Verification
     let runner = harness_runner::HarnessRunner { sess: &session, project: &project };
-    let results = runner.check_all_harnesses(&harnesses)?;
+    let report = runner.check_all_harnesses(&harnesses)?;
 
     if session.args.coverage {
         // We generate a timestamp to save the coverage data in a folder named
@@ -149,10 +155,10 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
         let timestamp = time_now.format(&format).unwrap();
 
         session.save_coverage_metadata(&project, &timestamp)?;
-        session.save_coverage_results(&project, &results, &timestamp)?;
+        session.save_coverage_results(&project, &report.executed, &timestamp)?;
     }
 
-    session.print_final_summary(&results)
+    session.print_final_summary(report)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -161,25 +167,26 @@ enum InvocationType {
     Standalone,
 }
 
-/// Peeks at command line arguments to determine if we're being invoked as 'kani' or 'cargo-kani'
+/// Recognize the public fork commands and the private upstream test aliases.
 fn determine_invocation_type(mut args: Vec<OsString>) -> InvocationType {
     let exe = util::executable_basename(&args.first());
 
     // Case 1: if 'kani' is our first real argument, then we're being invoked as cargo-kani
     // 'cargo kani ...' will cause cargo to run 'cargo-kani kani ...' preserving argv1
-    if Some(&OsString::from("kani")) == args.get(1) {
+    if args.get(1).is_some_and(|arg| arg == "varies-kani" || arg == "kani") {
         // Recreate our command line, but with 'kani' skipped
         args.remove(1);
         InvocationType::CargoKani(args)
     }
     // Case 2: if 'kani' is the name we're invoked as, then we're being invoked standalone
     // Note: we care about argv0 here, NOT std::env::current_exe(), as the later will be resolved
-    else if Some("kani".into()) == exe {
+    else if exe.as_deref().is_some_and(|name| name == "varies-kani" || name == "kani") {
         InvocationType::Standalone
     }
     // Case 3: if 'cargo-kani' is the name we're invoked as, then the user is directly invoking
     // 'cargo-kani' instead of 'cargo kani', and we shouldn't alter arguments.
-    else if Some("cargo-kani".into()) == exe {
+    else if exe.as_deref().is_some_and(|name| name == "cargo-varies-kani" || name == "cargo-kani")
+    {
         InvocationType::CargoKani(args)
     }
     // Case 4: default fallback, act like standalone
@@ -198,6 +205,27 @@ mod tests {
         fn x(args: Vec<&str>) -> Vec<OsString> {
             args.iter().map(|x| x.into()).collect()
         }
+
+        assert_eq!(
+            determine_invocation_type(x(vec!["cargo-varies-kani", "varies-kani", "--version"])),
+            InvocationType::CargoKani(x(vec!["cargo-varies-kani", "--version"]))
+        );
+        assert_eq!(
+            determine_invocation_type(x(vec![
+                "cargo-varies-kani",
+                "--manifest-path",
+                "Cargo.toml"
+            ])),
+            InvocationType::CargoKani(x(vec![
+                "cargo-varies-kani",
+                "--manifest-path",
+                "Cargo.toml"
+            ]))
+        );
+        assert_eq!(
+            determine_invocation_type(x(vec!["varies-kani", "input.rs"])),
+            InvocationType::Standalone
+        );
 
         // Case 1: 'cargo kani'
         assert_eq!(

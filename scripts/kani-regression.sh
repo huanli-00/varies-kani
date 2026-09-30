@@ -50,7 +50,6 @@ TESTS=(
     "expected expected"
     "ui expected"
     "std-checks cargo-kani"
-    "firecracker kani"
     "prusti kani"
     "smack kani"
     "cargo-kani cargo-kani"
@@ -80,21 +79,10 @@ for testp in "${TESTS[@]}"; do
       --quiet --no-fail-fast
 done
 
-# We rarely benefit from re-using build artifacts in the firecracker test,
-# and we often end up with incompatible leftover artifacts:
-# "error[E0514]: found crate `serde_derive` compiled by an incompatible version of rustc"
-# So if we're calling the full regression suite, wipe out old artifacts.
-if [ -d "$KANI_DIR/firecracker/build" ]; then
-  rm -rf "$KANI_DIR/firecracker/build"
-fi
-
-# Check codegen of firecracker
-time "$SCRIPT_DIR"/codegen-firecracker.sh
-
 # Test for --manifest-path which we cannot do through compiletest.
 # It should just successfully find the project and specified proof harness. (Then clean up.)
 FEATURES_MANIFEST_PATH="$KANI_DIR/tests/cargo-kani/cargo-features-flag/Cargo.toml"
-cargo kani --manifest-path "$FEATURES_MANIFEST_PATH" --harness trivial_success
+cargo varies-kani --manifest-path "$FEATURES_MANIFEST_PATH" --harness trivial_success
 cargo clean --manifest-path "$FEATURES_MANIFEST_PATH"
 
 # Build all packages in the workspace and ensure no warning is emitted.

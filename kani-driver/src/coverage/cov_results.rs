@@ -59,6 +59,10 @@ impl CoverageCheck {
     ) -> Self {
         Self { function, term, region, status }
     }
+
+    pub fn status(&self) -> CheckStatus {
+        self.status
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +70,7 @@ pub enum CoverageTerm {
     Counter(u32),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CoverageRegion {
     pub file: String,
     pub start: (u32, u32),

@@ -2,32 +2,39 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
 [package]
-name = "kani-verifier"
+name = "varies-kani-verifier"
 version = "0.65.0"
 edition = "2024"
 description = "A bit-precise model checker for Rust."
+autobins = false
 readme = "README.md"
 keywords = ["model-checking", "verification"]
 categories = ["development-tools"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/model-checking/kani"
-documentation = "https://model-checking.github.io/kani/"
-homepage = "https://github.com/model-checking/kani"
+repository = "https://github.com/huanli-00/varies-kani"
+documentation = "https://github.com/huanli-00/varies-kani#readme"
+homepage = "https://github.com/huanli-00/varies-kani"
 # N.B. Cargo.* is included automatically:
-include = ["/src", "/build.rs", "/rust-toolchain.toml", "/LICENSE-*", "/README.md", "/CHANGELOG.md"]
+include = ["/src", "/tests/launcher_namespace.rs", "/build.rs", "/rust-toolchain.toml", "/LICENSE-*", "/README.md"]
 
 [dependencies]
 anyhow = "1"
 home = "0.5"
 os_info = { version = "3", default-features = false }
 
-[[bin]]
-name = "kani"
-path = "src/bin/kani.rs"
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
-name = "cargo-kani"
-path = "src/bin/cargo_kani.rs"
+name = "varies-kani"
+path = "src/bin/varies_kani.rs"
+
+[[bin]]
+name = "cargo-varies-kani"
+path = "src/bin/cargo_varies_kani.rs"
+
+[lib]
+name = "kani_verifier"
 
 [profile.release]
 strip = "debuginfo"
@@ -38,7 +45,7 @@ debug = true
 strip = "none"
 lto = "off"
 
-# Below is the workspace (vs above is "kani-verifier" crate) config:
+# Below is the workspace (vs above is "varies-kani-verifier" crate) config:
 
 [workspace]
 members = [
@@ -47,8 +54,6 @@ members = [
   "tools/compiletest",
   "tools/build-kani",
   "tools/kani-cov",
-  "tools/scanner",
-  "tools/compile-timer",
   "kani-driver",
   "kani-compiler",
   "kani_metadata",
@@ -70,7 +75,7 @@ exclude = [
   "tests/kani-dependency-test/dependency3",
   # cargo kani tests should also have their own workspace
   "tests/cargo-kani",
-  "tests/perf",
+  "fixtures",
   "tests/cargo-ui",
   "tests/slow",
   "tests/std-checks",

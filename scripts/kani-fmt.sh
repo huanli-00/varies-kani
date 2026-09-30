@@ -28,9 +28,9 @@ error=0
 cargo fmt ${check_flag} || error=1
 
 # Check test source files.
-TESTS=("tests" "docs/src/tutorial")
+TESTS=("tests" "fixtures")
 # Add ignore patterns for code we don't want to format.
-IGNORE=("*/perf/s2n-quic/*")
+IGNORE=()
 
 # Arguments for the find command for excluding the IGNORE paths
 IGNORE_ARGS=()

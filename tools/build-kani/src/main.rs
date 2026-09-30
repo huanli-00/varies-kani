@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         }
         parser::Commands::Bundle(bundle_parser) => {
             let version_string = bundle_parser.version;
-            let kani_string = format!("kani-{version_string}");
+            let kani_string = format!("varies-kani-{version_string}");
             let bundle_name = format!("{kani_string}-{}.tar.gz", env!("TARGET"));
             let dir = Path::new(&kani_string);
 
@@ -69,8 +69,10 @@ fn prebundle(dir: &Path) -> Result<()> {
         );
     }
 
-    if which::which("cbmc").is_err() {
-        bail!("Couldn't find the 'cbmc' binary to include in the release bundle.");
+    for binary in ["cbmc", "goto-instrument", "goto-cc", "goto-analyzer", "kissat"] {
+        if which::which(binary).is_err() {
+            bail!("Couldn't find '{binary}' in PATH for the release bundle.");
+        }
     }
 
     build_tools(&["--release"])?;
@@ -111,6 +113,7 @@ fn bundle_kani(dir: &Path) -> Result<()> {
     // 5. Record the exact toolchain and rustc version we use
     std::fs::write(dir.join("rust-toolchain-version"), env!("RUSTUP_TOOLCHAIN"))?;
     std::fs::write(dir.join("rustc-version"), get_rustc_version()?)?;
+    std::fs::write(dir.join("varies-kani-version"), env!("CARGO_PKG_VERSION"))?;
 
     // 6. Include a licensing note
     cp(Path::new("tools/build-kani/license-notes.txt"), dir)?;
